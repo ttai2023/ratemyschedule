@@ -5,9 +5,16 @@ import { z } from "zod";
 
 const RMP_Professor = z.object({
   name: z.string(),
-  rmp_score: z.number(),
-  rmp_difficulty: z.number(),
-  rmp_would_take_again: z.number(),
+  department: z.string().optional(),
+  overall_quality: z.number(),
+  difficulty: z.number(),
+  would_take_again: z.number(),
+  num_ratings: z.number().int(),
+  average_grade: z.string().optional(),
+  average_hours_per_week: z.number().optional(),
+  tags: z.array(z.string()),
+  found: z.boolean(),
+  error: z.string().optional(),
 });
 
 const RMP_ProfessorData = z.object({
@@ -15,21 +22,20 @@ const RMP_ProfessorData = z.object({
 });
 
 const client = new BrowserUse();
-const UCSD_SID = "U2Nob29sLTEwNzk=" 
+const UCSD_SID = "U2Nob29sLTEwNzk=";
 
-const search_url = (
-        "https://www.ratemyprofessors.com/search/professors"
-        `?q=${professor_name}&sid=${UCSD_SID}`)
+async function scrapeProfessors(professorNames) {
+  const search_url = `https://www.ratemyprofessors.com/search/professors?q=${professorNames[0]}&sid=${UCSD_SID}`;
 
-    task = `
+  const task = `
     1. Go to this URL: ${search_url}
     2. This is a RateMyProfessor search filtered to UC San Diego.
 
     3. Look at the search results:
        - If NO professors are listed, return:
-         {{"found": false, "name": "{professor_name}", "error": "not found"}}
+         { "found": false, "name": "${professorNames[0]}", "error": "not found" }
        - If there are results, click on the professor whose name
-         best matches "{professor_name}".
+         best matches "${professorNames[0]}".
        - If there are multiple matches, prefer the one in a relevant
          department with the most ratings.
 
@@ -45,20 +51,21 @@ const search_url = (
 
     5. Return the data as a JSON object with these exact keys:
        name, department, overall_quality, difficulty,
-       would_take_again, num_ratings, top_tags, found
+       would_take_again, num_ratings, tags, found
 
        Example:
-       {{
+       {
          "name": "Gary Gillespie",
          "department": "Computer Science",
          "overall_quality": 4.2,
          "difficulty": 3.1,
          "would_take_again": 85.0,
          "num_ratings": 142,
-         "top_tags": ["Caring", "Respected", "Tough grader"],
-         "found": true
-       }}
-    `
+         "tags": ["Caring", "Respected", "Tough grader"],
+         "found": true,
+         "error": null
+       }
+  `;
 
 const result = await client.run(
   task,

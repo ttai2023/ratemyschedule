@@ -220,7 +220,7 @@ function rankSchedules(candidates, weights, prefs = {}) {
   return candidates.sort((a, b) => b.score - a.score);
 }
 
-module.exports = {
+export {
   rankSchedules,
   scoreSchedule,
   scoreRmp,
