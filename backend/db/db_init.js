@@ -15,7 +15,8 @@
  * and benefit from fast lookups via sqlite.
  */
 
-const db = require('better-sqlite3')('cache.db');
+import Database from 'better-sqlite3';
+const db = new Database('cache.db');
 
 db.pragma('journal_mode = WAL');
 // Enable Write-Ahead Logging for better concurrency

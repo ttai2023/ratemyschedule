@@ -7,8 +7,10 @@
  * @author Terri Tai
  */
 
-const db = require('better-sqlite3')('cache.db');
-const { rankSchedules } = require('./scorer');
+import Database from 'better-sqlite3';
+import { rankSchedules } from './scorer.js';
+
+const db = new Database('cache.db');
 
 /**
  * POST /api/rank
