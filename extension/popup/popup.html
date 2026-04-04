@@ -1,12 +1,259 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <title>Hello World</title>
-    <style>body { width: 200px; padding: 10px; }</style>
+    <meta charset="UTF-8" />
+    <title>Rate My Schedule</title>
+    <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <h1>Hello!</h1>
-    <button id="btn">Click Me</button>
+    <div id="app">
+      <header>
+        <h1>Rate My Schedule</h1>
+        <nav id="tabs">
+          <button class="tab active" data-tab="courses">Courses</button>
+          <button class="tab" data-tab="priorities">Priorities</button>
+          <button class="tab" data-tab="preferences">Preferences</button>
+          <button class="tab" data-tab="results">Results</button>
+          <button class="tab" data-tab="pass">Pass Strategy</button>
+        </nav>
+      </header>
+
+      <!-- Course Selection -->
+      <section id="tab-courses" class="tab-panel active">
+
+        <!-- Profile -->
+        <div class="profile-row">
+          <select id="college-select">
+            <option value="">College…</option>
+            <option>Revelle</option>
+            <option>Muir</option>
+            <option>Marshall</option>
+            <option>Warren</option>
+            <option>ERC</option>
+            <option>Sixth</option>
+            <option>Seventh</option>
+            <option>Eighth</option>
+          </select>
+          <select id="major-select">
+            <option value="">Major…</option>
+            <option>Computer Engineering</option>
+            <option>Computer Science</option>
+            <option>Data Science</option>
+            <option>Electrical Engineering</option>
+            <option>Mathematics-Computer Science</option>
+            <option>Other</option>
+          </select>
+        </div>
+
+        <!-- Search -->
+        <div class="search-row">
+          <select id="dept-select">
+            <option value="">Dept</option>
+            <option>CSE</option><option>ECE</option>
+          </select>
+          <input type="text" id="course-search" placeholder="Number or keyword" />
+          <button id="search-btn">Search</button>
+        </div>
+
+        <!-- Search results -->
+        <div id="search-results"></div>
+
+        <!-- My Courses -->
+        <div class="section-label">
+          My Courses <span id="course-count" class="badge">0</span>
+        </div>
+        <ul id="course-list" class="item-list">
+          <li class="empty-state">No courses added yet.</li>
+        </ul>
+
+        <!-- Completed Courses (collapsible) -->
+        <button class="collapsible-toggle" id="completed-toggle">
+          Completed Courses <span id="completed-count" class="badge">0</span>
+          <span class="toggle-arrow">▸</span>
+        </button>
+        <div id="completed-section" class="collapsible-body" style="display:none">
+          <div class="search-row">
+            <input type="text" id="completed-input" placeholder="e.g. CPSC 110" />
+            <button id="add-completed-btn">Add</button>
+          </div>
+          <ul id="completed-list" class="item-list">
+            <li class="empty-state">No completed courses yet.</li>
+          </ul>
+        </div>
+
+      </section>
+
+      <!-- Priorities -->
+      <section id="tab-priorities" class="tab-panel">
+
+        <div class="priority-header">
+          <p class="hint">Drag to reorder — top = highest priority</p>
+            <div class="curve-seg" id="curve-seg">
+            <button class="curve-btn active" data-curve="gentle">Gentle</button>
+            <button class="curve-btn" data-curve="balanced">Balanced</button>
+            <button class="curve-btn" data-curve="aggressive">Aggressive</button>
+          </div>
+        </div>
+
+        <ul id="priority-list" class="drag-list">
+          <li draggable="true" data-id="professor">
+            <span class="drag-handle">&#9776;</span>
+            <span class="priority-label">Professor Rating</span>
+            <span class="weight-pill"></span>
+          </li>
+          <li draggable="true" data-id="time">
+            <span class="drag-handle">&#9776;</span>
+            <span class="priority-label">Time of Day</span>
+            <span class="weight-pill"></span>
+          </li>
+          <li draggable="true" data-id="finals">
+            <span class="drag-handle">&#9776;</span>
+            <span class="priority-label">Finals Schedule</span>
+            <span class="weight-pill"></span>
+          </li>
+          <li draggable="true" data-id="days">
+            <span class="drag-handle">&#9776;</span>
+            <span class="priority-label">Days Off</span>
+            <span class="weight-pill"></span>
+          </li>
+          <li draggable="true" data-id="difficulty">
+            <span class="drag-handle">&#9776;</span>
+            <span class="priority-label">Difficulty Balance</span>
+            <span class="weight-pill"></span>
+          </li>
+        </ul>
+
+        <div class="weight-bar-wrap">
+          <div id="weight-bar" class="weight-bar"></div>
+          <div id="weight-bar-legend" class="weight-bar-legend"></div>
+        </div>
+
+      </section>
+
+      <!-- Preferences -->
+      <section id="tab-preferences" class="tab-panel">
+        <div class="pref-group">
+          <label>Earliest Start</label>
+          <select id="pref-start">
+            <option>7:00 AM</option>
+            <option>8:00 AM</option>
+            <option selected>9:00 AM</option>
+            <option>10:00 AM</option>
+            <option>11:00 AM</option>
+            <option>12:00 PM</option>
+          </select>
+        </div>
+        <div class="pref-group">
+          <label>Latest End</label>
+          <select id="pref-end">
+            <option>3:00 PM</option>
+            <option>4:00 PM</option>
+            <option selected>5:00 PM</option>
+            <option>6:00 PM</option>
+            <option>7:00 PM</option>
+            <option>8:00 PM</option>
+          </select>
+        </div>
+        <div class="pref-group">
+          <label>Day Pattern</label>
+          <div class="day-buttons">
+            <button class="day-btn active" data-day="Mon">M</button>
+            <button class="day-btn active" data-day="Tue">T</button>
+            <button class="day-btn active" data-day="Wed">W</button>
+            <button class="day-btn active" data-day="Thu">Th</button>
+            <button class="day-btn active" data-day="Fri">F</button>
+          </div>
+        </div>
+        <div class="pref-group">
+          <label>Hard Constraints</label>
+          <div class="checkbox-group">
+            <label><input type="checkbox" id="c-no-8am"> No 8 AM classes</label>
+            <label><input type="checkbox" id="c-no-fri"> No Friday classes</label>
+            <label><input type="checkbox" id="c-no-conflict"> No time conflicts</label>
+            <label><input type="checkbox" id="c-no-back2back"> Avoid back-to-back</label>
+          </div>
+        </div>
+      </section>
+
+      <!-- Results -->
+      <section id="tab-results" class="tab-panel">
+
+        <div id="results-empty" class="results-empty-state">
+          <p>Add courses and run analysis to see results.</p>
+          <button id="run-btn" class="btn-primary">Analyze Schedules</button>
+        </div>
+
+        <div id="results-content" style="display:none">
+
+          <!-- Nav row -->
+          <div class="results-nav">
+            <button id="sched-prev" class="nav-arrow" disabled>&#8249;</button>
+            <span id="sched-label" class="sched-label">Schedule 1 of 3</span>
+            <span id="sched-score-badge" class="sched-score-badge"></span>
+            <button id="sched-next" class="nav-arrow">&#8250;</button>
+            <button id="run-btn-rerun" class="btn-rerun">Re-run</button>
+          </div>
+
+          <!-- Score breakdown -->
+          <div id="score-breakdown" class="score-breakdown"></div>
+
+          <!-- Calendar -->
+          <div class="cal-container">
+            <div class="cal-days-header">
+              <div class="cal-time-gutter"></div>
+              <div class="cal-day-head">Mon</div>
+              <div class="cal-day-head">Tue</div>
+              <div class="cal-day-head">Wed</div>
+              <div class="cal-day-head">Thu</div>
+              <div class="cal-day-head">Fri</div>
+            </div>
+            <div class="cal-scroll">
+              <div class="cal-body" id="cal-body"></div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- Pass Strategy -->
+      <section id="tab-pass" class="tab-panel">
+
+        <div class="pass-columns">
+          <div class="pass-col">
+            <div class="pass-col-header">
+              <span class="pass-col-title">First Pass</span>
+              <span class="pass-col-hint">Enroll immediately</span>
+            </div>
+            <div class="pass-drop-zone" id="drop-first" data-pass="first">
+              <p class="empty-state">Click Auto-Assign or drag courses here.</p>
+            </div>
+          </div>
+          <div class="pass-col">
+            <div class="pass-col-header">
+              <span class="pass-col-title">Second Pass</span>
+              <span class="pass-col-hint">Add or swap later</span>
+            </div>
+            <div class="pass-drop-zone" id="drop-second" data-pass="second">
+              <p class="empty-state">Click Auto-Assign or drag courses here.</p>
+            </div>
+          </div>
+        </div>
+
+        <button id="assign-pass-btn" class="btn-primary">Auto-Assign</button>
+      </section>
+      <!-- Section detail overlay -->
+      <div id="section-detail" class="section-detail" style="display:none">
+        <div class="detail-header">
+          <div class="detail-header-left">
+            <span id="detail-code" class="detail-code"></span>
+            <span id="detail-name" class="detail-name"></span>
+          </div>
+          <button id="detail-close" class="detail-close">&times;</button>
+        </div>
+        <div id="detail-body" class="detail-body"></div>
+      </div>
+    </div>
+
     <script src="popup.js"></script>
   </body>
 </html>
