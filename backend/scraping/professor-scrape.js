@@ -8,15 +8,60 @@ const Professor = z.object({
   rmp_would_take_again: z.number(),
 });
 
-const HNPosts = z.object({
-  posts: z.array(Post),
+const ProfessorData = z.object({
+  professors: z.array(Professor),
 });
 
 const client = new BrowserUse();
+const UCSD_SID = "U2Nob29sLTEwNzk=" 
+
+const search_url = (
+        "https://www.ratemyprofessors.com/search/professors"
+        `?q=${professor_name}&sid=${UCSD_SID}`)
+
+    task = `
+    1. Go to this URL: ${search_url}
+    2. This is a RateMyProfessor search filtered to UC San Diego.
+
+    3. Look at the search results:
+       - If NO professors are listed, return:
+         {{"found": false, "name": "{professor_name}", "error": "not found"}}
+       - If there are results, click on the professor whose name
+         best matches "{professor_name}".
+       - If there are multiple matches, prefer the one in a relevant
+         department with the most ratings.
+
+    4. On the professor's profile page, extract:
+       - Their full name as displayed
+       - Their department
+       - Overall quality rating (the big number, 1-5 scale)
+       - Difficulty rating (1-5 scale)
+       - "Would take again" percentage
+       - Number of ratings
+       - The top tags shown (e.g. "Tough grader", "Get ready to read",
+         "Gives good feedback", etc.) — up to 5 tags
+
+    5. Return the data as a JSON object with these exact keys:
+       name, department, overall_quality, difficulty,
+       would_take_again, num_ratings, top_tags, found
+
+       Example:
+       {{
+         "name": "Gary Gillespie",
+         "department": "Computer Science",
+         "overall_quality": 4.2,
+         "difficulty": 3.1,
+         "would_take_again": 85.0,
+         "num_ratings": 142,
+         "top_tags": ["Caring", "Respected", "Tough grader"],
+         "found": true
+       }}
+    `
+
 const result = await client.run(
-  "List the top 20 posts on Hacker News today with their points",
-  { schema: HNPosts },
+  task,
+  { schema: ProfessorData },
 );
-for (const post of result.output.posts) {
-  console.log(`${post.name} (${post.points} pts, ${post.comments} comments)`);
+for (const professor of result.output.professors) {
+  console.log(`${professor.name} (${professor.overall_quality} pts, ${professor.num_ratings} ratings)`);
 }
