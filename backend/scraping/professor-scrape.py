@@ -1,11 +1,11 @@
 # backend/scraping/rmp_scraper.py
 
-from browser_use import Agent, Browser, BrowserConfig
+ browser_use import Agent, Browser, BrowserConfig
 from langchain_anthropic import ChatAnthropic
 from pydantic import BaseModel
 import json
 
-
+const 
 class ProfessorRating(BaseModel):
     """Structured output from the scraper."""
     name: str
@@ -74,7 +74,7 @@ async def scrape_rmp(professor_name: str) -> ProfessorRating:
     """
 
     llm = ChatAnthropic(
-        model_name="claude-sonnet-4-20250514",
+        model_name="claude-sonnet-4-5",
         temperature=0.0,
     )
 

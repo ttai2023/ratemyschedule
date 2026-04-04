@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 from contextlib import asynccontextmanager
 import json
 
-from backend.db.models import (
+from backend.models import (
     init_db, get_cached_professor, save_professor, normalize_name,
 )
 from backend.scraping.rmp_scraper import scrape_rmp
