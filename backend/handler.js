@@ -4,7 +4,7 @@
  * endpoints. Handles professor-score caching, schedule caching (both
  * via SQLITE database for fast lookups).
  * @version 1.0.0
- * @author Keramis
+ * @author Terri Tai
  */
 
 const db = require('better-sqlite3')('cache.db');

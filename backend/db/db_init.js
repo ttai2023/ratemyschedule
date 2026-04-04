@@ -4,7 +4,7 @@
  * This script should be run once to set up the database schema,
  * although it has safeguards to prevent overwriting existing data.
  * @version 1.0.0
- * @author Keramis
+ * @author Terri Tai
  */
 
 /**
