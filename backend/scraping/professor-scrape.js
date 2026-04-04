@@ -65,7 +65,8 @@ async function scrapeProfessors(professorNames) {
          "found": true,
          "error": null
        }
-  `;
+  `
+};
 
 const result = await client.run(
   task,
@@ -74,6 +75,7 @@ const result = await client.run(
 for (const professor of result.output.professors) {
   console.log(`${professor.name} (${professor.overall_quality} pts, ${professor.num_ratings} ratings)`);
 }
+
 
 // --------------------- END OF RATEMYPROFESSOR SCRAPER ---------------------
 
