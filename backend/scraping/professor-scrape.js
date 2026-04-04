@@ -3,9 +3,15 @@ import { z } from "zod";
 
 const Professor = z.object({
   name: z.string(),
+  rmp_course_code: z.string().optional(),
   rmp_score: z.number(),
   rmp_difficulty: z.number(),
   rmp_would_take_again: z.number(),
+  rmp_average_grade: z.string().optional(),
+  rmp_average_hours_per_week: z.number().optional(),
+  rmp_tags: z.array(z.string()),
+  found: z.boolean(),
+  error: z.string().optional(),
 });
 
 const ProfessorData = z.object({
@@ -48,13 +54,15 @@ const search_url = (
        Example:
        {{
          "name": "Gary Gillespie",
-         "department": "Computer Science",
+         "course_code": "CSE 100",
          "overall_quality": 4.2,
          "difficulty": 3.1,
          "would_take_again": 85.0,
-         "num_ratings": 142,
-         "top_tags": ["Caring", "Respected", "Tough grader"],
+         "average_grade": "B+",
+         "average_hours_per_week": 5.0,
+         "tags": ["Caring", "Respected", "Tough grader"],
          "found": true
+         "error": null
        }}
     `
 
