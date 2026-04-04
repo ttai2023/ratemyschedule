@@ -25,7 +25,7 @@ db.pragma('journal_mode = WAL');
 // create professors table so both tables can reference it
 db.exec(`
   CREATE TABLE IF NOT EXISTS professors (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE
   )
 `);
@@ -33,7 +33,7 @@ db.exec(`
 // Create rmp_evaluations table if it doesn't exist
 db.exec(`
   CREATE TABLE IF NOT EXISTS rmp_evaluations (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     professor_internal_id INTEGER REFERENCES professors(id),
     course_code TEXT,
     rmp_score REAL,
@@ -49,7 +49,7 @@ db.exec(`
 // create CAPE evaluations table if it doesn't exist
 db.exec(`
   CREATE TABLE IF NOT EXISTS cape_evaluations (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     professor_internal_id INTEGER REFERENCES professors(id),
     course_code TEXT,
     recommend_prof REAL,

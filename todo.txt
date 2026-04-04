@@ -1,0 +1,3 @@
+- Wire browser use session, notify user with frontend extension, popup
+the browser use live window for the user to login
+  - Ask the user to select 'remember me on this device' 

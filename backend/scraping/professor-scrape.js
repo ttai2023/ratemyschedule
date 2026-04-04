@@ -1,15 +1,17 @@
 import { BrowserUse } from "browser-use-sdk/v3";
 import { z } from "zod";
 
-const Professor = z.object({
+// --------------------- RATEMYPROFESSOR SCRAPER ---------------------
+
+const RMP_Professor = z.object({
   name: z.string(),
   rmp_score: z.number(),
   rmp_difficulty: z.number(),
   rmp_would_take_again: z.number(),
 });
 
-const ProfessorData = z.object({
-  professors: z.array(Professor),
+const RMP_ProfessorData = z.object({
+  professors: z.array(RMP_Professor),
 });
 
 const client = new BrowserUse();
@@ -60,8 +62,15 @@ const search_url = (
 
 const result = await client.run(
   task,
-  { schema: ProfessorData },
+  { schema: RMP_ProfessorData },
 );
 for (const professor of result.output.professors) {
   console.log(`${professor.name} (${professor.overall_quality} pts, ${professor.num_ratings} ratings)`);
 }
+
+// --------------------- END OF RATEMYPROFESSOR SCRAPER ---------------------
+
+
+
+// --------------------- CAPE SCRAPER (NEEDS AUTH) ---------------------
+
