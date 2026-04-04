@@ -4,7 +4,7 @@
  * This script should be run once to set up the database schema,
  * although it has safeguards to prevent overwriting existing data.
  * @version 1.0.0
- * @author Terri Tai
+ * @author Keramis
  */
 
 /**
@@ -22,11 +22,20 @@ db.pragma('journal_mode = WAL');
 
 //TODO: Add indexes on professor name and course code for faster lookups.
 
-// Create professors table if it doesn't exist
+// create professors table so both tables can reference it
 db.exec(`
   CREATE TABLE IF NOT EXISTS professors (
     id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
+    name TEXT UNIQUE
+  )
+`);
+
+// Create rmp_evaluations table if it doesn't exist
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rmp_evaluations (
+    id INTEGER PRIMARY KEY,
+    professor_internal_id INTEGER REFERENCES professors(id),
+    course_code TEXT,
     rmp_score REAL,
     rmp_difficulty REAL,
     rmp_would_take_again REAL,
@@ -41,7 +50,7 @@ db.exec(`
 db.exec(`
   CREATE TABLE IF NOT EXISTS cape_evaluations (
     id INTEGER PRIMARY KEY,
-    professor_id INTEGER REFERENCES professors(id),
+    professor_internal_id INTEGER REFERENCES professors(id),
     course_code TEXT,
     recommend_prof REAL,
     recommend_course REAL,
