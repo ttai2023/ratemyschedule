@@ -129,7 +129,7 @@ function scoreTime(sections, prefStart = 600, prefEnd = 960, hardLimits = {}) {
     const end   = toMins(m.end);
 
     // Hard limits — instant zero
-    if (hardLimits.neverBefore != null && start <= hardLimits.neverBefore) return 0;
+    if (hardLimits.neverBefore != null && start < hardLimits.neverBefore) return 0;
     if (hardLimits.neverAfter  != null && end   >= hardLimits.neverAfter)  return 0;
 
     if (start >= prefStart && end <= prefEnd) return 1.0;
@@ -163,7 +163,7 @@ function scoreFinals(sections) {
     .filter(t => t != null)
     .sort((a, b) => a - b);
 
-  if (times.length < 2) return 1.0;
+  if (times.length < 2) return sections.length < 2 ? 1.0 : 0.5;
 
   // Base: minimum gap between consecutive finals
   let minGapMs = Infinity;
@@ -252,15 +252,19 @@ function scoreDifficulty(sections, minHrs = 12, maxHrs = 20) {
 
   const total = withData.reduce((sum, s) => sum + s.capeHours, 0);
 
-  if (total >= minHrs && total <= maxHrs) return 1.0;
+  // Scale up if we only have partial data
+  const scaleFactor = sections.length / withData.length;
+  const estimated = total * scaleFactor;
 
-  if (total < minHrs) {
+  if (estimated >= minHrs && estimated <= maxHrs) return 1.0;
+
+  if (estimated < minHrs) {
     // Light load: interpolate from 0.3 (at 0 hrs) to 1.0 (at minHrs)
-    return clamp(0.3 + 0.7 * (total / minHrs));
+    return clamp(0.3 + 0.7 * (estimated / minHrs));
   }
 
   // Heavy load: decay from 1.0 (at maxHrs) to 0.0 (at 2×maxHrs)
-  return clamp(1 - (total - maxHrs) / maxHrs);
+  return clamp(1 - (estimated - maxHrs) / maxHrs);
 }
 
 // ── 6. Enrollment difficulty / pass recommendation ───────────
