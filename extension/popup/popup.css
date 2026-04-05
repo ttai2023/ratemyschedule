@@ -1014,6 +1014,18 @@ header h1 {
   gap: 5px;
 }
 
+.audit-courses-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.audit-courses-status {
+  font-size: 11px;
+  color: #667085;
+  margin: 0;
+}
+
 .badge {
   background: #2c3e7a;
   color: white;

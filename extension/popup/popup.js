@@ -1503,6 +1503,7 @@ function renderDegreeAudit(audit, statusText, isError = false) {
   }
   renderDegreeAuditPreview(audit.parsedAudit);
   setDegreeAuditStatus(statusText, isError);
+  if (audit.parsedAudit) populateCoursesFromAudit(audit.parsedAudit);
 }
 
 function renderNoAudit(message, isError = false) {
@@ -1530,77 +1531,93 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ── Search ─────────────────────────────────────────────────────
-document.getElementById("search-btn").addEventListener("click", runSearch);
-document.getElementById("course-search").addEventListener("keydown", e => {
-  if (e.key === "Enter") runSearch();
-});
+// ── Audit-driven course extraction ─────────────────────────────
 
-async function runSearch() {
-  const dept = document.getElementById("dept-select").value;
-  const q    = document.getElementById("course-search").value.trim();
-  if (!dept && !q) return;
-
-  const container = document.getElementById("search-results");
-  container.innerHTML = '<p class="search-loading">Searching…</p>';
-
-  // Build query: prefer dept+q combo, fall back to whichever is set
-  const query = [dept, q].filter(Boolean).join(" ");
-  try {
-    const params = new URLSearchParams({ q: query });
-    const res  = await fetch(`${API_BASE}/api/search?${params}`);
-    if (!res.ok) throw new Error("API error");
-    const data = await res.json();
-    // API returns { results: [{course_code, instructors, section_count}], count }
-    // Map to display shape: {code, name, units, instructors:[{name}]}
-    const mapped = (data.results ?? []).map(r => ({
-      code:        r.course_code,
-      name:        r.course_code,  // WebReg doesn't return a long name — use code for now
-      units:       r.section_count + " sec",
-      instructors: (r.instructors ?? []).map(n => ({ name: n, rmp: null })),
-    }));
-    renderSearchResults(mapped);
-  } catch {
-    container.innerHTML = '<p class="search-error">Could not reach API. Is the server running?</p>';
+/**
+ * Walk the parsed degree audit and collect course codes that are still
+ * needed — i.e., the `selectCourses.items` from every unfulfilled or
+ * in-progress subrequirement.
+ */
+function extractRequiredCourses(parsedAudit) {
+  const codes = new Set();
+  for (const req of parsedAudit?.requirements ?? []) {
+    if (req.status === "complete") continue;
+    for (const sub of req.subrequirements ?? []) {
+      if (sub.status === "complete") continue;
+      for (const code of sub.selectCourses ?? []) {
+        const normalized = code.trim().toUpperCase();
+        if (normalized) codes.add(normalized);
+      }
+    }
   }
+  return [...codes];
 }
 
-function renderSearchResults(results) {
-  const container = document.getElementById("search-results");
-  if (!results.length) {
-    container.innerHTML = '<p class="empty-state">No courses found.</p>';
+/**
+ * Given a parsed audit, find which required courses are offered this
+ * term (via /api/sections), populate the `courses` array, and
+ * re-render the course list.
+ */
+async function populateCoursesFromAudit(parsedAudit) {
+  const statusEl = document.getElementById("audit-courses-status");
+
+  const needed = extractRequiredCourses(parsedAudit);
+  if (!needed.length) {
+    statusEl.textContent = "No unfulfilled course requirements found in your audit.";
     return;
   }
-  container.innerHTML = results.map(c => {
-    const instructorHtml = (c.instructors ?? []).map(i =>
-      `${esc(i.name)}${i.rmp != null ? ` <span class="rmp-badge">★${i.rmp}</span>` : ""}`
-    ).join(", ") || "TBA";
-    const added = courses.some(x => x.code === c.code);
-    return `
-      <div class="course-card">
-        <div class="course-card-top">
-          <div class="course-card-info">
-            <span class="course-code">${esc(c.code)}</span>
-            <span class="course-card-name">${esc(c.name)}</span>
-          </div>
-          <button class="add-result-btn${added ? " added" : ""}" data-code="${esc(c.code)}">
-            ${added ? "✓" : "+"}
-          </button>
-        </div>
-        <div class="course-card-meta">${esc(c.units)} cr · ${instructorHtml}</div>
-      </div>`;
-  }).join("");
 
-  container.querySelectorAll(".add-result-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const result = results.find(r => r.code === btn.dataset.code);
-      if (result) {
-        addCourseFromResult(result);
-        btn.textContent = "✓";
-        btn.classList.add("added");
+  statusEl.textContent = `Checking ${needed.length} required courses against this term's schedule…`;
+
+  let available = [];
+  try {
+    // Batch-lookup: API accepts up to 10 at a time
+    const chunks = [];
+    for (let i = 0; i < needed.length; i += 10) chunks.push(needed.slice(i, i + 10));
+
+    for (const chunk of chunks) {
+      const res = await fetch(`${API_BASE}/api/sections`, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ courses: chunk }),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const [code, courseData] of Object.entries(data.results ?? {})) {
+        const instructors = [
+          ...new Set(
+            (courseData.sections ?? [])
+              .filter(s => s.type === "LE")
+              .map(s => s.instructor)
+              .filter(n => n && n !== "Staff")
+          ),
+        ];
+        available.push({
+          code,
+          name:        courseData.course_title || code,
+          units:       (courseData.sections?.length ?? 0) + " sec",
+          instructors: instructors.map(n => ({ name: n, rmp: null })),
+        });
       }
-    });
-  });
+    }
+  } catch {
+    statusEl.textContent = "Could not reach the schedule API. Is the server running?";
+    return;
+  }
+
+  // Clear and repopulate
+  courses.length = 0;
+  for (const c of available) {
+    if (!courses.some(x => x.code === c.code)) courses.push(c);
+  }
+
+  const notFound = needed.length - available.length;
+  const parts = [`${available.length} required course${available.length !== 1 ? "s" : ""} loaded`];
+  if (notFound > 0) parts.push(`${notFound} not offered this term`);
+  statusEl.textContent = parts.join(" · ");
+
+  renderCourseList();
+  syncPassLists();
 }
 
 // ── My Courses ─────────────────────────────────────────────────
@@ -2024,7 +2041,7 @@ function adaptSection(sec, fallbackIdx) {
 
 async function launchResults() {
   if (courses.length === 0) {
-    alert("Add at least one course first.");
+    alert("Fetch your degree audit first — no required courses loaded.");
     return;
   }
 
@@ -2043,7 +2060,7 @@ async function launchResults() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         courses:  courses.map(c => c.code),
-        topN:     5,
+        topN:     3,
         weights:  getCurrentWeights(),
         prefs:    getCurrentPrefs(),
       }),
@@ -2085,7 +2102,7 @@ function renderSchedule() {
   const n = activeSchedules.length;
 
   // Nav
-  const labelMain = `Schedule ${currentScheduleIdx + 1} of ${n}`;
+  const labelMain = `Top ${currentScheduleIdx + 1} of ${n}`;
   const labelSub  = s.summary ? ` — ${s.summary}` : "";
   document.getElementById("sched-label").textContent = labelMain + labelSub;
   document.getElementById("sched-prev").disabled = currentScheduleIdx === 0;

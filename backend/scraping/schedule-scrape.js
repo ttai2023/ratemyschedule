@@ -206,7 +206,7 @@ function cleanInstructor(name) {
  *   "NC" = new/current (also active)
  *   "CA" = cancelled
  */
-function transformCourseData(subjCode, crseCode, rawSections) {
+function transformCourseData(subjCode, crseCode, rawSections, courseTitle = "") {
   const courseCode = `${subjCode.trim()} ${crseCode.trim()}`;
   const sectionMap = {};
 
@@ -264,6 +264,7 @@ function transformCourseData(subjCode, crseCode, rawSections) {
 
   return {
     course_code: courseCode,
+    course_title: courseTitle,
     sections: Object.values(sectionMap),
   };
 }
@@ -303,17 +304,16 @@ async function buildQuarterJSON(termCode = "S126") {
   console.log(`[webreg] Fetching course list for ${termCode}...`);
   const allCourses = await fetchAllCourses(termCode);
 
-  // Group courses by subject
+  // Group courses by subject, preserving titles
   const subjects = {};
   for (const course of allCourses) {
     const subj = course.SUBJ_CODE?.trim();
     const crse = course.CRSE_CODE?.trim();
+    const title = course.CRSE_TITLE?.trim() ?? "";
     if (!subj || !crse) continue;
 
-    if (!subjects[subj]) subjects[subj] = [];
-    if (!subjects[subj].includes(crse)) {
-      subjects[subj].push(crse);
-    }
+    if (!subjects[subj]) subjects[subj] = {};
+    if (!subjects[subj][crse]) subjects[subj][crse] = title;
   }
 
   const deptCount = Object.keys(subjects).length;
@@ -324,10 +324,10 @@ async function buildQuarterJSON(termCode = "S126") {
   let errorCount = 0;
 
   for (const [subj, courses] of Object.entries(subjects)) {
-    console.log(`[webreg]   ${subj} (${courses.length} courses)...`);
+    console.log(`[webreg]   ${subj} (${Object.keys(courses).length} courses)...`);
     schedule[termCode][subj] = {};
 
-    for (const crse of courses) {
+    for (const [crse, title] of Object.entries(courses)) {
       try {
         const raw = await fetchCourseSections(subj, crse, termCode);
 
@@ -335,7 +335,7 @@ async function buildQuarterJSON(termCode = "S126") {
         // with no sections scheduled yet
         if (!Array.isArray(raw) || raw.length === 0) continue;
 
-        const transformed = transformCourseData(subj, crse, raw);
+        const transformed = transformCourseData(subj, crse, raw, title);
         schedule[termCode][subj][transformed.course_code] = transformed;
         courseCount++;
 
@@ -384,32 +384,31 @@ async function buildDepartments(deptList, termCode = "S126") {
   );
   const allCourses = await fetchAllCourses(termCode);
 
-  // Filter to only requested departments
+  // Filter to only requested departments, preserving titles
   const subjects = {};
   for (const course of allCourses) {
     const subj = course.SUBJ_CODE?.trim();
     const crse = course.CRSE_CODE?.trim();
+    const title = course.CRSE_TITLE?.trim() ?? "";
     if (!subj || !crse) continue;
     if (!deptList.includes(subj)) continue;
 
-    if (!subjects[subj]) subjects[subj] = [];
-    if (!subjects[subj].includes(crse)) {
-      subjects[subj].push(crse);
-    }
+    if (!subjects[subj]) subjects[subj] = {};
+    if (!subjects[subj][crse]) subjects[subj][crse] = title;
   }
 
   const schedule = { [termCode]: {} };
 
   for (const [subj, courses] of Object.entries(subjects)) {
-    console.log(`[webreg]   ${subj} (${courses.length} courses)...`);
+    console.log(`[webreg]   ${subj} (${Object.keys(courses).length} courses)...`);
     schedule[termCode][subj] = {};
 
-    for (const crse of courses) {
+    for (const [crse, title] of Object.entries(courses)) {
       try {
         const raw = await fetchCourseSections(subj, crse, termCode);
         if (!Array.isArray(raw) || raw.length === 0) continue;
 
-        const transformed = transformCourseData(subj, crse, raw);
+        const transformed = transformCourseData(subj, crse, raw, title);
         schedule[termCode][subj][transformed.course_code] = transformed;
         await sleep(200);
       } catch (err) {
@@ -520,9 +519,11 @@ function searchCourses(termCode, query) {
 
   for (const [, deptCourses] of Object.entries(termData)) {
     for (const [courseCode, courseData] of Object.entries(deptCourses)) {
-      if (courseCode.toUpperCase().includes(q)) {
+      const titleUpper = (courseData.course_title ?? "").toUpperCase();
+      if (courseCode.toUpperCase().includes(q) || titleUpper.includes(q)) {
         results.push({
           course_code: courseCode,
+          course_title: courseData.course_title ?? "",
           section_count: courseData.sections?.length || 0,
           // Grab instructor from the first lecture section
           instructors: [

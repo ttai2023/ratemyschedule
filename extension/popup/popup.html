@@ -51,50 +51,16 @@
           </div>
         </section>
 
-        <!-- Profile -->
-        <div class="profile-row">
-          <select id="college-select">
-            <option value="">College…</option>
-            <option>Revelle</option>
-            <option>Muir</option>
-            <option>Marshall</option>
-            <option>Warren</option>
-            <option>ERC</option>
-            <option>Sixth</option>
-            <option>Seventh</option>
-            <option>Eighth</option>
-          </select>
-          <select id="major-select">
-            <option value="">Major…</option>
-            <option>Computer Engineering</option>
-            <option>Computer Science</option>
-            <option>Data Science</option>
-            <option>Electrical Engineering</option>
-            <option>Mathematics-Computer Science</option>
-            <option>Other</option>
-          </select>
+        <!-- Audit-driven course loading -->
+        <div id="audit-courses-panel" class="audit-courses-panel">
+          <div class="section-label">
+            Required Courses <span id="course-count" class="badge">0</span>
+          </div>
+          <p id="audit-courses-status" class="audit-courses-status">Fetch your degree audit above to load required courses.</p>
+          <ul id="course-list" class="item-list">
+            <li class="empty-state">No courses loaded yet.</li>
+          </ul>
         </div>
-
-        <!-- Search -->
-        <div class="search-row">
-          <select id="dept-select">
-            <option value="">Dept</option>
-            <option>CSE</option><option>ECE</option>
-          </select>
-          <input type="text" id="course-search" placeholder="Number or keyword" />
-          <button id="search-btn">Search</button>
-        </div>
-
-        <!-- Search results -->
-        <div id="search-results"></div>
-
-        <!-- My Courses -->
-        <div class="section-label">
-          My Courses <span id="course-count" class="badge">0</span>
-        </div>
-        <ul id="course-list" class="item-list">
-          <li class="empty-state">No courses added yet.</li>
-        </ul>
 
         <!-- Completed Courses (collapsible) -->
         <button class="collapsible-toggle" id="completed-toggle">
@@ -209,8 +175,8 @@
       <section id="tab-results" class="tab-panel">
 
         <div id="results-empty" class="results-empty-state">
-          <p>Add courses and run analysis to see results.</p>
-          <button id="run-btn" class="btn-primary">Analyze Schedules</button>
+          <p>Load your degree audit, then generate your top 3 schedules.</p>
+          <button id="run-btn" class="btn-primary">Generate Top 3 Schedules</button>
         </div>
 
         <div id="results-content" style="display:none">
