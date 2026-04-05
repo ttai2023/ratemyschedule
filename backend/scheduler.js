@@ -1,45 +1,45 @@
 /**
- * scheduler.js
+ * scheduler.js  —  Schedule generation with linked-section support
  *
- * 3B: Schedule Generation
+ * Section grouping convention (UCSD WebReg):
+ *   section_id prefix letter → offering group   e.g. "A", "B"
+ *   numeric suffix "00"      → lecture (LE)
+ *   numeric suffix "01","02" → discussion (DI) or lab (LA)
  *
- * Takes a list of course codes, looks up all their sections from memory,
- * and generates every valid (non-conflicting) combination of one section
- * per course.
+ *   MATH 183:  A00(LE)  A01(DI)  A02(DI)
+ *     → bundles: [A00+A01], [A00+A02]
  *
- * A "schedule" is:
- * {
- *   sections: [
- *     { courseCode, section_id, instructor, rmp_quality?, cape_recommend_prof?,
- *       capeHours?, meetings: [{days, start, end}], final? }
- *   ]
- * }
+ *   MATH 142A: A00(LE) A01(DI),  B00(LE) B01(DI)
+ *     → bundles: [A00+A01], [B00+B01]   (groups are independent offerings)
  *
- * Conflict rules:
- *   - Two meeting blocks overlap if one starts before the other ends,
- *     on at least one shared day.
- *   - Finals conflicts are not pruned here — scorer penalises them instead.
+ * A "bundle" is the smallest enrollable unit for a course:
+ *   one lecture + one discussion (if the group has DI/LA sections).
  *
- * Cap: MAX_CANDIDATES prevents combinatorial explosion. Returns the first
- * MAX_CANDIDATES valid combinations found (breadth-first over sections).
+ * A "schedule" = one bundle per requested course, no meeting conflicts.
+ *
+ * Conflict: two meetings overlap iff they share at least one calendar day
+ *   AND their time intervals overlap (non-inclusive endpoints).
+ *
+ * Cap: MAX_CANDIDATES prevents combinatorial explosion.
+ * Top-N filtering: only the top N by score are returned to the caller.
  */
 
 import { getCourse } from "./scraping/webreg.js";
 
-const MAX_CANDIDATES = 500;
+const MAX_CANDIDATES = 2000; // internal search cap before scoring
 
-// ── Helpers ───────────────────────────────────────────────────
+// ── Time / day helpers ────────────────────────────────────────
 
-/** "HH:MM" → minutes since midnight. */
+/** "HH:MM" → minutes since midnight. Pass-through for numbers. */
 function toMins(t) {
   if (typeof t === "number") return t;
-  const [h, m = 0] = String(t).split(":").map(Number);
-  return h * 60 + m;
+  const [h, m = "0"] = String(t).split(":");
+  return parseInt(h, 10) * 60 + parseInt(m, 10);
 }
 
 /**
- * "MWF" → ["M","W","F"],  "TuTh" → ["Tu","Th"],  "Sa" → ["Sa"]
- * Two-char codes are parsed first.
+ * "MWF" → ["M","W","F"]   "TuTh" → ["Tu","Th"]
+ * Two-char codes (Tu, Th, Sa, Su) are parsed before single-char.
  */
 function expandDays(str) {
   const out = [];
@@ -55,35 +55,29 @@ function expandDays(str) {
   return out;
 }
 
-/**
- * Do two meeting blocks conflict?
- * Each block: { days: "MWF", start: "10:00", end: "10:50" }
- */
+/** Do two meeting blocks conflict? */
 function meetingsConflict(a, b) {
   const aDays = new Set(expandDays(a.days ?? ""));
   const bDays = new Set(expandDays(b.days ?? ""));
-  const sharedDay = [...aDays].some(d => bDays.has(d));
-  if (!sharedDay) return false;
+  if (![...aDays].some(d => bDays.has(d))) return false;
 
-  const aStart = toMins(a.start);
-  const aEnd   = toMins(a.end);
-  const bStart = toMins(b.start);
-  const bEnd   = toMins(b.end);
-
-  // Overlap: not (aEnd <= bStart || bEnd <= aStart)
-  return !(aEnd <= bStart || bEnd <= aStart);
+  const aS = toMins(a.start), aE = toMins(a.end);
+  const bS = toMins(b.start), bE = toMins(b.end);
+  return !(aE <= bS || bE <= aS);
 }
 
 /**
- * Does adding `candidate` section conflict with any already-chosen section?
- * @param {Object[]} chosen   Already-selected sections.
- * @param {Object}   candidate  Section to test.
+ * Does a candidate bundle conflict with any already-chosen bundle?
+ * All meetings of all sections in both bundles are compared.
  */
-function conflictsWithChosen(chosen, candidate) {
-  for (const sec of chosen) {
-    for (const ma of sec.meetings ?? []) {
-      for (const mb of candidate.meetings ?? []) {
-        if (meetingsConflict(ma, mb)) return true;
+function bundleConflictsWithChosen(chosen, candidate) {
+  const candMeetings = candidate.flatMap(s => s.meetings ?? []);
+  for (const bundle of chosen) {
+    for (const sec of bundle) {
+      for (const ma of sec.meetings ?? []) {
+        for (const mb of candMeetings) {
+          if (meetingsConflict(ma, mb)) return true;
+        }
       }
     }
   }
@@ -92,93 +86,157 @@ function conflictsWithChosen(chosen, candidate) {
 
 // ── Section normaliser ────────────────────────────────────────
 
-/**
- * Convert a raw WebReg section object into the shape scorer.js expects,
- * keeping the original fields intact and adding courseCode.
- */
-function normaliseSection(rawSection, courseCode) {
+function normaliseSection(raw, courseCode) {
   return {
     courseCode,
-    section_id:          rawSection.section_id,
-    section_number:      rawSection.section_number,
-    type:                rawSection.type,
-    instructor:          rawSection.instructor,
-    // Professor enrichment fields (populated later by enrichSections)
-    rmp_quality:         rawSection.rmp_quality         ?? null,
-    cape_recommend_prof: rawSection.cape_recommend_prof ?? null,
-    capeHours:           rawSection.capeHours           ?? null,
-    meetings:            rawSection.meetings ?? [],
-    final:               rawSection.final   ?? null,
-    seats_total:         rawSection.seats_total,
-    seats_available:     rawSection.seats_available,
-    enrolled:            rawSection.enrolled,
-    waitlist:            rawSection.waitlist,
-    status:              rawSection.status,
+    section_id:          raw.section_id,
+    section_number:      raw.section_number,
+    type:                raw.type,
+    instructor:          raw.instructor,
+    rmp_quality:         raw.rmp_quality         ?? null,
+    cape_recommend_prof: raw.cape_recommend_prof ?? null,
+    capeHours:           raw.capeHours           ?? null,
+    meetings:            raw.meetings ?? [],
+    final:               raw.final    ?? null,
+    seats_total:         raw.seats_total,
+    seats_available:     raw.seats_available,
+    enrolled:            raw.enrolled,
+    waitlist:            raw.waitlist,
+    status:              raw.status,
   };
+}
+
+// ── Bundle builder ────────────────────────────────────────────
+
+/**
+ * Extract the group-letter prefix from a section_id.
+ * "A00" → "A",  "B02" → "B",  "A01" → "A"
+ */
+function groupLetter(sectionId) {
+  const m = String(sectionId ?? "").match(/^([A-Za-z]+)/);
+  return m ? m[1].toUpperCase() : "A";
+}
+
+/**
+ * Build all valid enrollable bundles for one course.
+ *
+ * A bundle is an array of section objects the student must take together
+ * (lecture + linked discussion/lab, if any).
+ *
+ * Strategy:
+ *   1. Group sections by their prefix letter (A, B, C, …).
+ *   2. Within each group, separate lectures from discussions/labs.
+ *   3. Produce cartesian product: each LE × each DI (× each LA if present).
+ *   4. If a group has no DI/LA, each LE is its own single-section bundle.
+ *   5. If a group has DI/LA but NO lecture (edge case), bundle each DI/LA alone.
+ *
+ * @param {Object[]} rawSections   All sections for the course from WebReg.
+ * @param {string}   courseCode    e.g. "CSE 140"
+ * @returns {Array[]}  Array of bundles; each bundle is an array of normalised sections.
+ */
+function buildBundles(rawSections, courseCode) {
+  const normalised = rawSections.map(s => normaliseSection(s, courseCode));
+
+  // Group by prefix letter
+  const groups = {};
+  for (const sec of normalised) {
+    const g = groupLetter(sec.section_id);
+    (groups[g] ??= []).push(sec);
+  }
+
+  const bundles = [];
+
+  for (const [, secs] of Object.entries(groups)) {
+    const lectures = secs.filter(s => s.type === "LE");
+    const discs    = secs.filter(s => s.type === "DI" || s.type === "LA");
+
+    if (lectures.length === 0 && discs.length === 0) continue;
+
+    if (lectures.length === 0) {
+      // No lecture in this group — treat each disc/lab as a standalone bundle
+      discs.forEach(d => bundles.push([d]));
+      continue;
+    }
+
+    if (discs.length === 0) {
+      // Lecture-only course or group — each lecture is its own bundle
+      lectures.forEach(le => bundles.push([le]));
+      continue;
+    }
+
+    // LE × DI — cartesian product (each lecture paired with each discussion)
+    for (const le of lectures) {
+      for (const di of discs) {
+        bundles.push([le, di]);
+      }
+    }
+  }
+
+  return bundles;
 }
 
 // ── Main generator ────────────────────────────────────────────
 
 /**
- * Generate valid schedule candidates.
+ * Generate all non-conflicting schedule candidates for the given courses,
+ * then return the top `topN` by descending score index (scoring is done
+ * by the caller via rankSchedules).
  *
- * @param {string[]} courseCodes   e.g. ["CSE 100", "CSE 101", "MATH 183"]
+ * @param {string[]} courseCodes   e.g. ["CSE 140", "MATH 183"]
  * @param {string}   term          e.g. "S126"
  * @param {Object}   [options]
- * @param {string[]} [options.sectionTypes]  Only include these types.
- *   Default: ["LE"] (lectures only). Pass ["LE","DI","LA"] to include
- *   discussions/labs, but note: the combinatorial explosion is much larger.
- * @returns {{ schedules: Object[], totalSections: number[] }}
- *   schedules: up to MAX_CANDIDATES { sections: [...] } objects
- *   totalSections: number of available sections per course (for diagnostics)
+ * @param {number}   [options.topN=5]          Max schedules to return.
+ * @returns {{
+ *   schedules:     { sections: Object[] }[],
+ *   totalBundles:  number[],   bundles available per course
+ *   missing:       string[],   courses not found in the schedule data
+ * }}
  */
 function generateSchedules(courseCodes, term, options = {}) {
-  const { sectionTypes = ["LE"] } = options;
+  void options; // caller slices top-N after ranking
 
-  // Build a list-of-lists: perCourse[i] = sections available for courseCodes[i]
-  const perCourse = [];
-  const totalSections = [];
+  const perCourseBundles = [];
+  const totalBundles     = [];
+  const missing          = [];
 
   for (const code of courseCodes) {
-    const subj = code.split(" ")[0].toUpperCase();
+    const subj   = code.split(" ")[0].toUpperCase();
     const course = getCourse(term, subj, code.toUpperCase());
 
     if (!course) {
-      // Unknown course — treat as a course with zero sections (will yield 0 schedules)
-      perCourse.push([]);
-      totalSections.push(0);
+      missing.push(code);
+      perCourseBundles.push([]);
+      totalBundles.push(0);
       continue;
     }
 
-    const sections = (course.sections ?? [])
-      .filter(s => sectionTypes.includes(s.type))
-      .map(s => normaliseSection(s, code.toUpperCase()));
-
-    perCourse.push(sections);
-    totalSections.push(sections.length);
+    const bundles = buildBundles(course.sections ?? [], code.toUpperCase());
+    perCourseBundles.push(bundles);
+    totalBundles.push(bundles.length);
   }
 
-  // Short-circuit: if any course has no sections, no valid schedule is possible
-  if (perCourse.some(list => list.length === 0)) {
-    return { schedules: [], totalSections };
+  // Any course with zero bundles → no valid schedule possible
+  if (perCourseBundles.some(b => b.length === 0)) {
+    return { schedules: [], totalBundles, missing };
   }
 
-  // Backtracking combination search
+  // Backtracking search over bundle combinations
   const schedules = [];
 
-  function backtrack(courseIdx, chosen) {
+  function backtrack(courseIdx, chosenBundles) {
     if (schedules.length >= MAX_CANDIDATES) return;
 
-    if (courseIdx === perCourse.length) {
-      schedules.push({ sections: [...chosen] });
+    if (courseIdx === perCourseBundles.length) {
+      // Flatten all bundles into a single sections array
+      schedules.push({ sections: chosenBundles.flat() });
       return;
     }
 
-    for (const section of perCourse[courseIdx]) {
-      if (!conflictsWithChosen(chosen, section)) {
-        chosen.push(section);
-        backtrack(courseIdx + 1, chosen);
-        chosen.pop();
+    for (const bundle of perCourseBundles[courseIdx]) {
+      if (!bundleConflictsWithChosen(chosenBundles, bundle)) {
+        chosenBundles.push(bundle);
+        backtrack(courseIdx + 1, chosenBundles);
+        chosenBundles.pop();
         if (schedules.length >= MAX_CANDIDATES) return;
       }
     }
@@ -186,7 +244,8 @@ function generateSchedules(courseCodes, term, options = {}) {
 
   backtrack(0, []);
 
-  return { schedules, totalSections };
+  // Return up to topN (caller will rank before slicing; we pass all for ranking)
+  return { schedules, totalBundles, missing };
 }
 
-export { generateSchedules };
+export { generateSchedules, buildBundles };
