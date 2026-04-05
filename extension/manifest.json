@@ -7,6 +7,16 @@
     "default_popup": "popup/popup.html",
     "default_icon": "icon.png"
   },
-  "permissions": ["activeTab"],
-  "host_permissions": ["http://localhost:3000/*"]
+  "permissions": ["activeTab", "storage", "scripting", "tabs"],
+  "host_permissions": [
+    "http://localhost:3000/*",
+    "https://act.ucsd.edu/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://act.ucsd.edu/*"],
+      "js": ["ucsd-content.js"],
+      "run_at": "document_idle"
+    }
+  ]
 }
