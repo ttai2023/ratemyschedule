@@ -28,6 +28,8 @@ const DEGREE_AUDIT_CACHE_KEY = "degreeAudit.latest";
 const DEGREE_AUDIT_LOCAL_STORAGE_KEY = "degreeAudit.latest.local";
 const DEGREE_AUDIT_CACHE_VERSION = 1;
 const DEGREE_AUDIT_DEBUG_LIMIT = 30;
+const DEGREE_AUDIT_AUTH_RECOVERY_RETRIES = 1;
+const DEGREE_AUDIT_AUTH_RECOVERY_WAIT_MS = 3500;
 
 const degreeAuditEls = {
   status: document.getElementById("degree-audit-status"),
@@ -96,24 +98,73 @@ async function fetchMostRecentAuditManually() {
   setDegreeAuditStatus("Fetching your most recent completed audit...");
   pushDegreeAuditDebug("Manual fetch requested.");
 
+  const maxAttempts = 1 + DEGREE_AUDIT_AUTH_RECOVERY_RETRIES;
+  let lastError = null;
+
   try {
-    await refreshLatestAudit({
-      successStatus: "Showing your most recent completed audit.",
-    });
-  } catch (error) {
-    const message = error?.message || "Could not load degree audits.";
-    pushDegreeAuditDebug(`Fetch failed: ${message}`);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await refreshLatestAudit({
+          successStatus: "Showing your most recent completed audit.",
+        });
+        if (attempt > 1) {
+          pushDegreeAuditDebug(`Manual fetch recovered on retry ${attempt}/${maxAttempts}.`);
+        }
+        return;
+      } catch (error) {
+        lastError = error;
+        const message = error?.message || "Could not load degree audits.";
+        pushDegreeAuditDebug(`Fetch attempt ${attempt}/${maxAttempts} failed: ${message}`);
+
+        const canRetry = attempt < maxAttempts && shouldTryAuditAuthRecovery(message);
+        if (!canRetry) break;
+
+        setDegreeAuditStatus("Audit auth looks stale. Opening DARS and retrying...");
+        await openAuditCreatePageForAuthRecovery(attempt);
+        pushDegreeAuditDebug(`Waiting ${DEGREE_AUDIT_AUTH_RECOVERY_WAIT_MS}ms before retry.`);
+        await wait(DEGREE_AUDIT_AUTH_RECOVERY_WAIT_MS);
+      }
+    }
+
+    const finalMessage = lastError?.message || "Could not load degree audits.";
     if (degreeAuditState.latestAudit) {
       renderDegreeAudit(
         degreeAuditState.latestAudit,
-        `${message} Showing the cached audit instead.`,
+        `${finalMessage} Showing the cached audit instead.`,
         true
       );
-    } else {
-      renderNoAudit(message, true);
+      return;
     }
+
+    renderNoAudit(finalMessage, true);
   } finally {
     endAuditAction();
+  }
+}
+
+function shouldTryAuditAuthRecovery(message) {
+  const text = String(message || "");
+  return /sign in|login|auth|session|studentdarsselfservice|401|403|could not fetch audit data|degree audit request failed/i
+    .test(text);
+}
+
+async function openAuditCreatePageForAuthRecovery(attemptNumber) {
+  pushDegreeAuditDebug(
+    `Opening DARS create page to refresh auth session (retry ${attemptNumber}/${DEGREE_AUDIT_AUTH_RECOVERY_RETRIES}).`
+  );
+
+  if (chrome?.tabs?.create) {
+    try {
+      await chrome.tabs.create({ url: DARS_CREATE_URL, active: true });
+      return;
+    } catch (error) {
+      pushDegreeAuditDebug(`chrome.tabs.create failed: ${error?.message || error}`);
+    }
+  }
+
+  const openedWindow = window.open(DARS_CREATE_URL, "_blank", "noopener,noreferrer");
+  if (!openedWindow) {
+    pushDegreeAuditDebug("Could not open DARS create page automatically (popup may have been blocked).");
   }
 }
 
