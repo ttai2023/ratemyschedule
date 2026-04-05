@@ -25,7 +25,9 @@ const DARS_BASE_URL = "https://act.ucsd.edu/studentDarsSelfservice/audit/";
 const DARS_LIST_URL = new URL("list.html", DARS_BASE_URL).toString();
 const DARS_CREATE_URL = new URL("create.html", DARS_BASE_URL).toString();
 const DEGREE_AUDIT_CACHE_KEY = "degreeAudit.latest";
-const DEGREE_AUDIT_DEBUG_LIMIT = 18;
+const DEGREE_AUDIT_LOCAL_STORAGE_KEY = "degreeAudit.latest.local";
+const DEGREE_AUDIT_CACHE_VERSION = 1;
+const DEGREE_AUDIT_DEBUG_LIMIT = 30;
 
 const degreeAuditEls = {
   status: document.getElementById("degree-audit-status"),
@@ -34,7 +36,8 @@ const degreeAuditEls = {
   program: document.getElementById("degree-audit-program"),
   created: document.getElementById("degree-audit-created"),
   openLink: document.getElementById("degree-audit-open-link"),
-  frame: document.getElementById("degree-audit-frame"),
+  preview: document.getElementById("degree-audit-preview"),
+  fetchBtn: document.getElementById("fetch-audit-btn"),
   requestBtn: document.getElementById("request-audit-btn"),
   debugLog: document.getElementById("degree-audit-debug-log"),
 };
@@ -42,75 +45,111 @@ const degreeAuditEls = {
 const degreeAuditState = {
   latestAudit: null,
   isWorking: false,
+  activeAction: null,
   debugLines: [],
   cacheWarningShown: false,
 };
 
+degreeAuditEls.fetchBtn.addEventListener("click", fetchMostRecentAuditManually);
 degreeAuditEls.requestBtn.addEventListener("click", requestNewAudit);
 initializeDegreeAudit();
 
 async function initializeDegreeAudit() {
+  exposeDegreeAuditApi();
   pushDegreeAuditDebug("Popup opened. Starting degree audit bootstrap.");
+  updateAuditButtons();
   await renderCachedAudit();
-  await refreshLatestAudit();
+  if (degreeAuditState.latestAudit) {
+    setDegreeAuditStatus("Loaded cached audit. Click Fetch Most Recent Audit to refresh.");
+    return;
+  }
+
+  renderNoAudit("No audit loaded yet. Click Fetch Most Recent Audit to load your latest degree audit.");
+  pushDegreeAuditDebug("Waiting for a manual degree-audit fetch.");
 }
 
 async function renderCachedAudit() {
-  const cachedAudit = await readCachedAudit();
-  if (!cachedAudit) return;
+  const cached = await readCachedAudit();
+  if (!cached) {
+    pushDegreeAuditDebug("No cached audit found.");
+    return;
+  }
+
+  const { audit: cachedAudit, source } = cached;
+  if (!cachedAudit.parsedAudit && cachedAudit.rawHtml) {
+    try {
+      cachedAudit.parsedAudit = parseDegreeAuditHtml(cachedAudit.rawHtml, cachedAudit);
+    } catch (error) {
+      pushDegreeAuditDebug(`Cached audit parse failed: ${error?.message || error}`);
+    }
+  }
 
   degreeAuditState.latestAudit = cachedAudit;
-  pushDegreeAuditDebug(`Loaded cached audit ${cachedAudit.id || "(unknown id)"}.`);
+  pushDegreeAuditDebug(`Loaded cached audit ${cachedAudit.id || "(unknown id)"} from ${source}.`);
   renderDegreeAudit(cachedAudit, "Loaded your cached audit.");
 }
 
-async function refreshLatestAudit() {
-  setDegreeAuditStatus("Checking for your most recent audit...");
-  pushDegreeAuditDebug("Refreshing latest audit from manage audits.");
+async function fetchMostRecentAuditManually() {
+  if (degreeAuditState.isWorking) return;
+
+  beginAuditAction("fetch");
+  setDegreeAuditStatus("Fetching your most recent completed audit...");
+  pushDegreeAuditDebug("Manual fetch requested.");
 
   try {
-    const latestDescriptor = await fetchLatestAuditDescriptor();
-    if (!latestDescriptor) {
-      degreeAuditState.latestAudit = null;
-      renderNoAudit("No completed audits found yet.");
-      await clearCachedAudit();
-      pushDegreeAuditDebug("Manage audits returned no completed audit rows.");
-      return;
-    }
-
-    if (degreeAuditState.latestAudit?.id === latestDescriptor.id) {
-      renderDegreeAudit(
-        degreeAuditState.latestAudit,
-        "Showing your most recent completed audit."
-      );
-      return;
-    }
-
-    const hydratedAudit = await hydrateAudit(latestDescriptor);
-    renderDegreeAudit(hydratedAudit, "Showing your most recent completed audit.");
-    await writeCachedAudit(hydratedAudit);
-    pushDegreeAuditDebug(`Latest audit ready: ${hydratedAudit.id}.`);
+    await refreshLatestAudit({
+      successStatus: "Showing your most recent completed audit.",
+    });
   } catch (error) {
     const message = error?.message || "Could not load degree audits.";
-    pushDegreeAuditDebug(`Refresh failed: ${message}`);
+    pushDegreeAuditDebug(`Fetch failed: ${message}`);
     if (degreeAuditState.latestAudit) {
       renderDegreeAudit(
         degreeAuditState.latestAudit,
         `${message} Showing the cached audit instead.`,
         true
       );
-      return;
+    } else {
+      renderNoAudit(message, true);
     }
-
-    renderNoAudit(message, true);
+  } finally {
+    endAuditAction();
   }
+}
+
+async function refreshLatestAudit(options = {}) {
+  const successStatus = options.successStatus || "Showing your most recent completed audit.";
+  pushDegreeAuditDebug("Refreshing latest audit from manage audits.");
+
+  const latestDescriptor = await fetchLatestAuditDescriptor();
+  if (!latestDescriptor) {
+    degreeAuditState.latestAudit = null;
+    renderNoAudit("No completed audits found yet.");
+    await clearCachedAudit();
+    pushDegreeAuditDebug("Manage audits returned no completed audit rows.");
+    return null;
+  }
+
+  if (
+    degreeAuditState.latestAudit?.id === latestDescriptor.id &&
+    degreeAuditState.latestAudit?.parsedAudit
+  ) {
+    renderDegreeAudit(degreeAuditState.latestAudit, successStatus);
+    pushDegreeAuditDebug(`Latest audit unchanged (${latestDescriptor.id}); reused loaded data.`);
+    return degreeAuditState.latestAudit;
+  }
+
+  const hydratedAudit = await hydrateAudit(latestDescriptor);
+  renderDegreeAudit(hydratedAudit, successStatus);
+  await writeCachedAudit(hydratedAudit);
+  pushDegreeAuditDebug(`Latest audit ready: ${hydratedAudit.id}.`);
+  return hydratedAudit;
 }
 
 async function requestNewAudit() {
   if (degreeAuditState.isWorking) return;
 
-  degreeAuditState.isWorking = true;
-  setRequestButtonState(true);
+  beginAuditAction("request");
   setDegreeAuditStatus("Working.. requesting a new degree audit.");
   pushDegreeAuditDebug("Requesting a new degree audit.");
 
@@ -139,13 +178,13 @@ async function requestNewAudit() {
     renderDegreeAudit(latestAudit, "New degree audit is ready.");
     await writeCachedAudit(latestAudit);
     pushDegreeAuditDebug(`New audit completed: ${latestAudit.id}.`);
+    await refreshLatestAudit({ successStatus: "New degree audit is ready." });
   } catch (error) {
     const message = error?.message || "Could not request a new audit.";
     pushDegreeAuditDebug(`Request failed: ${message}`);
     setDegreeAuditStatus(message, true);
   } finally {
-    degreeAuditState.isWorking = false;
-    setRequestButtonState(false);
+    endAuditAction();
   }
 }
 
@@ -238,15 +277,19 @@ async function fetchLatestAuditDescriptor() {
 async function hydrateAudit(descriptor) {
   pushDegreeAuditDebug(`Fetching full audit HTML from ${descriptor.readUrl}.`);
   const auditHtml = await fetchAuditText(descriptor.readUrl);
-  const previewHtml = buildAuditPreview(auditHtml);
+  const parsedAudit = parseDegreeAuditHtml(auditHtml, descriptor);
 
   const hydrated = {
     ...descriptor,
-    previewHtml,
+    rawHtml: auditHtml,
+    parsedAudit,
     fetchedAt: new Date().toISOString(),
   };
 
   degreeAuditState.latestAudit = hydrated;
+  pushDegreeAuditDebug(
+    `Parsed audit: requirements=${parsedAudit.summary.requirementCount}, subrequirements=${parsedAudit.summary.subrequirementCount}, courses=${parsedAudit.summary.completedCourseCount}.`
+  );
   return hydrated;
 }
 
@@ -278,69 +321,557 @@ function parseLatestAuditDescriptor(listHtml) {
   };
 }
 
-function buildAuditPreview(auditHtml) {
+function parseDegreeAuditHtml(auditHtml, descriptor = {}) {
   const doc = new DOMParser().parseFromString(auditHtml, "text/html");
-  doc.querySelectorAll("script, style, link, noscript").forEach(node => node.remove());
+  const student = parseAuditStudentInfo(doc, descriptor);
+  const requirements = parseAuditRequirements(doc);
+  const summary = buildAuditSummary(student, requirements);
 
-  const main = doc.querySelector("#main") || doc.body;
-  const cloned = main.cloneNode(true);
-  cloned.querySelectorAll("a").forEach(link => {
-    link.setAttribute("target", "_blank");
-    link.setAttribute("rel", "noreferrer");
+  return {
+    parsedAt: new Date().toISOString(),
+    student,
+    descriptor: {
+      id: descriptor.id || "",
+      readUrl: descriptor.readUrl || "",
+      program: descriptor.program || "",
+      catalogYear: descriptor.catalogYear || "",
+      createdAt: descriptor.createdAt || "",
+      format: descriptor.format || "",
+    },
+    summary,
+    requirements,
+  };
+}
+
+function parseAuditStudentInfo(doc, descriptor) {
+  const titleLines = parseAuditTitleLines(doc);
+  const headerEntries = parseAuditHeaderEntries(doc);
+  const completionText = cleanText(
+    doc.querySelector("#auditHeader .completionTextNO, #auditHeader .completionTextOK, #auditHeader .completionText")
+      ?.textContent
+  );
+
+  return {
+    name: titleLines[0] || "",
+    programName: titleLines[1] || descriptor.program || "",
+    pid: headerEntries.pid || "",
+    programCode: headerEntries.program_code || descriptor.program || "",
+    catalogYear: headerEntries.catalog_year || descriptor.catalogYear || "",
+    preparedOn: headerEntries.prepared_on || descriptor.createdAt || "",
+    graduationDate: headerEntries.graduation_date || "",
+    jobId: headerEntries.job_id || "",
+    admissionText: cleanText(doc.querySelector("#auditHeader .includeTopText")?.textContent),
+    completionText,
+    headerEntries,
+  };
+}
+
+function parseAuditTitleLines(doc) {
+  const titleNode = doc.querySelector(".auditTitle");
+  if (!titleNode) return [];
+
+  const clone = titleNode.cloneNode(true);
+  clone.querySelectorAll(".floatright, script, style").forEach(node => node.remove());
+  return splitHtmlLines(clone);
+}
+
+function parseAuditHeaderEntries(doc) {
+  const labels = Array.from(doc.querySelectorAll(".auditHeaderEntryLabel"));
+  const values = Array.from(doc.querySelectorAll(".auditHeaderEntry"));
+  const entries = {};
+  const max = Math.min(labels.length, values.length);
+
+  for (let i = 0; i < max; i++) {
+    const rawLabel = cleanText(labels[i]?.textContent).replace(/:$/, "");
+    const value = cleanText(values[i]?.textContent);
+    if (!rawLabel) continue;
+    entries[normalizeHeaderKey(rawLabel)] = value;
+  }
+
+  return entries;
+}
+
+function parseAuditRequirements(doc) {
+  const requirementNodes = Array.from(doc.querySelectorAll("#auditRequirements > .requirement"));
+  return requirementNodes.map(node => parseAuditRequirement(node));
+}
+
+function parseAuditRequirement(node) {
+  const statusCode = extractStatusCode(node.className);
+  const status = normalizeStatus(statusCode);
+  const totals = parseMetricRows(node.querySelector(".requirementTotals"));
+  const subrequirements = Array.from(node.querySelectorAll(".auditSubrequirements > .subrequirement"))
+    .map(subNode => parseAuditSubrequirement(subNode));
+  const categoryMatch = String(node.className || "").match(/\bcategory_([^\s]+)/);
+
+  return {
+    id: node.id || "",
+    rname: node.getAttribute("rname") || "",
+    pseudo: node.getAttribute("pseudo") || "",
+    category: categoryMatch ? categoryMatch[1].replace(/_/g, " ") : "",
+    statusCode,
+    status,
+    title: cleanText(node.querySelector(".reqTitle")?.textContent),
+    headerText: cleanText(node.querySelector(".reqHeader")?.textContent),
+    requiredSubrequirements: parseNumber(node.getAttribute("rqdsubreq")),
+    requiredCount: parseNumber(node.getAttribute("rqdcount")),
+    requiredGpa: parseNumber(node.getAttribute("rqdgpa")),
+    requiredHours: parseNumber(node.getAttribute("rqdhours")),
+    totals,
+    subrequirements,
+  };
+}
+
+function parseAuditSubrequirement(node) {
+  const statusNode = node.querySelector(".subreqPretext .status") || node.querySelector(".status");
+  const statusCode = extractStatusCode((statusNode && statusNode.className) || node.className);
+  const status = normalizeStatus(statusCode);
+  const selectOptions = parseSelectCourseOptions(node);
+  const pseudoListRaw = node.getAttribute("pseudolist") || "";
+  let pseudoList = [];
+  try {
+    pseudoList = JSON.parse(pseudoListRaw);
+  } catch {
+    pseudoList = pseudoListRaw ? [pseudoListRaw] : [];
+  }
+
+  return {
+    id: node.id || "",
+    pseudo: node.getAttribute("pseudo") || "",
+    pseudoList,
+    number: cleanText(node.querySelector(".subreqNumber")?.textContent),
+    statusCode,
+    status,
+    title: cleanText(node.querySelector(".subreqTitle")?.textContent),
+    requiredSubrequirements: parseNumber(node.getAttribute("rqdsubreq")),
+    requiredGpa: parseNumber(node.getAttribute("rqdgpa")),
+    requiredHours: parseNumber(node.getAttribute("rqdhours")),
+    totals: parseMetricRows(node.querySelector(".subrequirementTotals")),
+    needs: parseNeedsRows(node),
+    completedCourses: parseCompletedCourses(node),
+    selectCoursesText: selectOptions.text,
+    selectCourses: selectOptions.items,
+    notCoursesText: cleanText(
+      node.querySelector("table.notcourses .fromcourselist")?.textContent ||
+      node.querySelector("table.notcourses")?.textContent
+    ),
+  };
+}
+
+function parseNeedsRows(subNode) {
+  return Array.from(subNode.querySelectorAll("table.subreqNeeds tr")).map(row => {
+    const label = cleanText(row.querySelector(".rowlabel")?.textContent);
+    const hoursText = cleanText(row.querySelector(".hours.number")?.textContent);
+    const countText = cleanText(row.querySelector(".count.number")?.textContent);
+    const hoursLabel = cleanText(row.querySelector(".hourslabel")?.textContent);
+    const countLabel = cleanText(row.querySelector(".countlabel")?.textContent);
+    const rawText = cleanText(row.textContent);
+    return {
+      label: label || null,
+      hoursText: hoursText || null,
+      hoursValue: parseNumber(hoursText),
+      hoursLabel: hoursLabel || null,
+      countText: countText || null,
+      countValue: parseNumber(countText),
+      countLabel: countLabel || null,
+      rawText,
+    };
+  }).filter(row => row.rawText);
+}
+
+function parseCompletedCourses(subNode) {
+  const courseRows = Array.from(subNode.querySelectorAll("table.completedCourses tr.takenCourse"));
+  return courseRows.map(row => {
+    const grade = cleanText(row.querySelector(".grade")?.textContent);
+    const inProgress = row.classList.contains("ip") || /\bWIP\b/i.test(grade);
+
+    return {
+      term: cleanText(row.querySelector(".term")?.textContent),
+      course: cleanText(row.querySelector(".course")?.textContent),
+      creditText: cleanText(row.querySelector(".credit")?.textContent),
+      creditValue: parseNumber(row.querySelector(".credit")?.textContent),
+      grade,
+      conditionCode: cleanText(row.querySelector(".ccode")?.textContent),
+      description: cleanText(row.querySelector(".description")?.textContent),
+      isInProgress: inProgress,
+    };
+  });
+}
+
+function parseSelectCourseOptions(subNode) {
+  const listNode = subNode.querySelector("table.selectcourses .fromcourselist");
+  const text = cleanText(listNode?.textContent);
+  const items = Array.from(subNode.querySelectorAll("table.selectcourses .course .number"))
+    .map(node => cleanText(node.textContent))
+    .filter(Boolean);
+
+  return {
+    text,
+    items: Array.from(new Set(items)),
+  };
+}
+
+function parseMetricRows(table) {
+  if (!table) return [];
+
+  return Array.from(table.querySelectorAll("tr")).map(row => {
+    const rowType = cleanText((row.className || "").split(/\s+/)[0]);
+    const label = cleanText(row.querySelector(".rowlabel")?.textContent);
+    const hoursText = cleanText(row.querySelector(".hours.number")?.textContent);
+    const countText = cleanText(row.querySelector(".count.number")?.textContent);
+    const subreqsText = cleanText(row.querySelector(".subreqs.number")?.textContent);
+    const gpaText = cleanText(row.querySelector(".gpa.number")?.textContent);
+    const pointsText = cleanText(row.querySelector(".points.number")?.textContent);
+    const rawText = cleanText(row.textContent);
+
+    return {
+      rowType: rowType || null,
+      label: label || null,
+      hoursText: hoursText || null,
+      hoursValue: parseNumber(hoursText),
+      hoursLabel: cleanText(row.querySelector(".hourslabel")?.textContent) || null,
+      countText: countText || null,
+      countValue: parseNumber(countText),
+      countLabel: cleanText(row.querySelector(".countlabel")?.textContent) || null,
+      subreqsText: subreqsText || null,
+      subreqsValue: parseNumber(subreqsText),
+      subreqsLabel: cleanText(row.querySelector(".subreqslabel")?.textContent) || null,
+      gpaText: gpaText || null,
+      gpaValue: parseNumber(gpaText),
+      gpaLabel: cleanText(row.querySelector(".gpalabel")?.textContent) || null,
+      pointsText: pointsText || null,
+      pointsValue: parseNumber(pointsText),
+      pointsLabel: cleanText(row.querySelector(".pointslabel")?.textContent) || null,
+      rawText,
+    };
+  }).filter(row => row.rawText);
+}
+
+function buildAuditSummary(student, requirements) {
+  const requirementStatusCounts = createStatusCounter();
+  const subrequirementStatusCounts = createStatusCounter();
+  const seenCourses = new Set();
+  let inProgressCourseCount = 0;
+  let subrequirementCount = 0;
+  let outstandingRequirementCount = 0;
+  let outstandingSubrequirementCount = 0;
+  let remainingCourseCount = 0;
+  let remainingUnitCount = 0;
+
+  requirements.forEach(requirement => {
+    incrementStatusCounter(requirementStatusCounts, requirement.status);
+    if (requirement.status !== "complete" && requirement.status !== "none") {
+      outstandingRequirementCount += 1;
+    }
+
+    requirement.totals.forEach(row => {
+      const rowTag = `${row.label || ""} ${row.rowType || ""}`.toLowerCase();
+      if (!/needs/.test(rowTag)) return;
+      if (row.countValue != null) remainingCourseCount += row.countValue;
+      if (row.hoursValue != null) remainingUnitCount += row.hoursValue;
+    });
+
+    requirement.subrequirements.forEach(sub => {
+      subrequirementCount += 1;
+      incrementStatusCounter(subrequirementStatusCounts, sub.status);
+      if (sub.status !== "complete" && sub.status !== "none") {
+        outstandingSubrequirementCount += 1;
+      }
+
+      sub.needs.forEach(need => {
+        if (need.countValue != null) remainingCourseCount += need.countValue;
+        if (need.hoursValue != null) remainingUnitCount += need.hoursValue;
+      });
+
+      sub.completedCourses.forEach(course => {
+        const key = `${course.term}|${course.course}|${course.creditText}|${course.grade}|${course.description}`;
+        if (!seenCourses.has(key)) {
+          seenCourses.add(key);
+          if (course.isInProgress) inProgressCourseCount += 1;
+        }
+      });
+    });
   });
 
-  return `<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <base href="${DARS_BASE_URL}">
-    <style>
-      body {
-        margin: 0;
-        padding: 12px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        font-size: 12px;
-        line-height: 1.45;
-        color: #1a1a2e;
-        background: white;
-      }
+  const unitRequirement = requirements.find(req =>
+    req.rname === "TOTALHRX" || /minimum of 180 units/i.test(req.title)
+  );
+  const gpaRequirement = requirements.find(req =>
+    req.rname === "TOTALGPAX" || /uc gpa/i.test(req.title)
+  );
 
-      h1, h2, h3, h4 {
-        color: #2c3e7a;
-        margin: 0 0 8px;
-      }
+  const earnedUnitsRow = unitRequirement?.totals.find(row => String(row.rowType).toLowerCase() === "reqearned");
+  const wipUnitsRow = unitRequirement?.totals.find(row => String(row.rowType).toLowerCase() === "reqipdetail");
+  const gpaRow = gpaRequirement?.totals.find(row => String(row.rowType).toLowerCase() === "reqearned");
 
-      p, ul, ol, table {
-        margin: 0 0 10px;
-      }
+  return {
+    completionText: student.completionText || "",
+    requirementCount: requirements.length,
+    subrequirementCount,
+    requirementStatusCounts,
+    subrequirementStatusCounts,
+    completedCourseCount: seenCourses.size,
+    inProgressCourseCount,
+    outstandingRequirementCount,
+    outstandingSubrequirementCount,
+    remainingCourseCount: roundToTwo(remainingCourseCount),
+    remainingUnitCount: roundToTwo(remainingUnitCount),
+    minimumUnitProgress: {
+      earnedUnits: earnedUnitsRow?.hoursValue ?? null,
+      inProgressUnits: wipUnitsRow?.hoursValue ?? null,
+      targetUnits: unitRequirement?.requiredHours ?? null,
+    },
+    ucGpa: gpaRow?.gpaValue ?? null,
+  };
+}
 
-      table {
-        width: 100%;
-        border-collapse: collapse;
-      }
+function createStatusCounter() {
+  return {
+    complete: 0,
+    in_progress: 0,
+    planned: 0,
+    unfulfilled: 0,
+    none: 0,
+  };
+}
 
-      th, td {
-        border: 1px solid #d0d5e8;
-        padding: 6px;
-        text-align: left;
-        vertical-align: top;
-      }
+function incrementStatusCounter(counter, status) {
+  if (counter[status] == null) {
+    counter.none += 1;
+    return;
+  }
+  counter[status] += 1;
+}
 
-      th {
-        background: #f5f7ff;
-      }
+function extractStatusCode(className) {
+  const expanded = String(className || "");
+  let match = expanded.match(/\bStatus_(OK|NO|IP|PL|NONE)\b/i);
+  if (match) return match[1].toUpperCase();
+  match = expanded.match(/\bstatus(OK|NO|IP|PL|NONE)\b/i);
+  if (match) return match[1].toUpperCase();
+  return "NONE";
+}
 
-      a {
-        color: #2c3e7a;
-      }
+function normalizeStatus(code) {
+  const statusCode = String(code || "NONE").toUpperCase();
+  if (statusCode === "OK") return "complete";
+  if (statusCode === "NO") return "unfulfilled";
+  if (statusCode === "IP") return "in_progress";
+  if (statusCode === "PL") return "planned";
+  return "none";
+}
 
-      .btn, button, input, select, textarea {
-        display: none !important;
-      }
-    </style>
-  </head>
-  <body>${cloned.innerHTML}</body>
-</html>`;
+function statusLabel(status) {
+  if (status === "complete") return "Complete";
+  if (status === "unfulfilled") return "Unfulfilled";
+  if (status === "in_progress") return "In Progress";
+  if (status === "planned") return "Planned";
+  return "Info";
+}
+
+function renderDegreeAuditPreview(parsedAudit) {
+  if (!parsedAudit) {
+    degreeAuditEls.preview.innerHTML = `
+      <div class="audit-preview-root">
+        <div class="audit-preview-card audit-muted">
+          No parsed audit details are available. Fetch the most recent audit to populate this view.
+        </div>
+      </div>`;
+    return;
+  }
+
+  const summary = parsedAudit.summary || {};
+  const student = parsedAudit.student || {};
+  const requirementsHtml = (parsedAudit.requirements || []).map(requirement =>
+    renderRequirementPreview(requirement)
+  ).join("");
+
+  const minimumUnitBits = [];
+  if (summary.minimumUnitProgress?.earnedUnits != null) {
+    minimumUnitBits.push(`${summary.minimumUnitProgress.earnedUnits} earned`);
+  }
+  if (summary.minimumUnitProgress?.inProgressUnits != null) {
+    minimumUnitBits.push(`${summary.minimumUnitProgress.inProgressUnits} WIP`);
+  }
+  if (summary.minimumUnitProgress?.targetUnits != null) {
+    minimumUnitBits.push(`${summary.minimumUnitProgress.targetUnits} target`);
+  }
+
+  degreeAuditEls.preview.innerHTML = `
+    <div class="audit-preview-root">
+      <div class="audit-preview-card">
+        <div class="audit-preview-title">${esc(student.name || "Student")}</div>
+        <div class="audit-preview-subtitle">
+          ${esc(student.programName || student.programCode || "Degree Program")}
+          ${student.pid ? ` | PID ${esc(student.pid)}` : ""}
+        </div>
+        ${student.preparedOn ? `<div class="audit-preview-subtitle">Prepared On: ${esc(student.preparedOn)}</div>` : ""}
+        ${summary.completionText ? `<div class="audit-completion-text">${esc(summary.completionText)}</div>` : ""}
+      </div>
+
+      <div class="audit-summary-grid">
+        <div class="audit-summary-item">
+          <span class="audit-summary-label">Requirements</span>
+          <span class="audit-summary-value">${esc(String(summary.requirementCount || 0))} total | ${esc(String(summary.outstandingRequirementCount || 0))} open</span>
+        </div>
+        <div class="audit-summary-item">
+          <span class="audit-summary-label">Subrequirements</span>
+          <span class="audit-summary-value">${esc(String(summary.subrequirementCount || 0))} total | ${esc(String(summary.outstandingSubrequirementCount || 0))} open</span>
+        </div>
+        <div class="audit-summary-item">
+          <span class="audit-summary-label">Completed Courses</span>
+          <span class="audit-summary-value">${esc(String(summary.completedCourseCount || 0))} (${esc(String(summary.inProgressCourseCount || 0))} WIP)</span>
+        </div>
+        <div class="audit-summary-item">
+          <span class="audit-summary-label">Needs (aggregate)</span>
+          <span class="audit-summary-value">${esc(String(summary.remainingCourseCount || 0))} courses | ${esc(String(summary.remainingUnitCount || 0))} units</span>
+        </div>
+        <div class="audit-summary-item">
+          <span class="audit-summary-label">Minimum Units</span>
+          <span class="audit-summary-value">${esc(minimumUnitBits.join(" | ") || "Not available")}</span>
+        </div>
+        <div class="audit-summary-item">
+          <span class="audit-summary-label">UC GPA</span>
+          <span class="audit-summary-value">${summary.ucGpa != null ? esc(String(summary.ucGpa)) : "Not available"}</span>
+        </div>
+      </div>
+
+      ${requirementsHtml || `<div class="audit-preview-card audit-muted">No requirements found in this audit.</div>`}
+    </div>
+  `;
+}
+
+function renderRequirementPreview(requirement) {
+  const title = requirement.title || requirement.headerText || requirement.rname || "Requirement";
+  const open = requirement.status !== "complete" ? " open" : "";
+  const subrequirementsHtml = requirement.subrequirements.map(sub => renderSubrequirementPreview(sub)).join("");
+  const totalsHtml = renderMetricList(requirement.totals);
+
+  return `
+    <details class="audit-requirement"${open}>
+      <summary>
+        ${renderStatusBadge(requirement.status)}
+        <span class="audit-requirement-title">${esc(title)}</span>
+      </summary>
+      <div class="audit-requirement-body">
+        ${requirement.headerText && requirement.headerText !== requirement.title ? `<div class="audit-muted">${esc(requirement.headerText)}</div>` : ""}
+        ${totalsHtml}
+        ${subrequirementsHtml || `<div class="audit-muted">No subrequirements listed.</div>`}
+      </div>
+    </details>
+  `;
+}
+
+function renderSubrequirementPreview(subrequirement) {
+  const open = subrequirement.status !== "complete" ? " open" : "";
+  const title = subrequirement.title || "Subrequirement";
+  const numberPrefix = subrequirement.number ? `${esc(subrequirement.number)} ` : "";
+  const totalsHtml = renderMetricList(subrequirement.totals);
+  const needsHtml = renderNeedsList(subrequirement.needs);
+  const coursesHtml = renderCompletedCoursesTable(subrequirement.completedCourses);
+
+  return `
+    <details class="audit-subrequirement"${open}>
+      <summary>
+        ${renderStatusBadge(subrequirement.status)}
+        <span class="audit-subrequirement-title">${numberPrefix}${esc(title)}</span>
+      </summary>
+      <div class="audit-subrequirement-body">
+        ${totalsHtml}
+        ${needsHtml}
+        ${coursesHtml}
+        ${subrequirement.selectCoursesText ? `<div class="audit-options-block"><strong>Course Options:</strong> ${esc(subrequirement.selectCoursesText)}</div>` : ""}
+        ${subrequirement.notCoursesText ? `<div class="audit-options-block"><strong>Excluded Courses:</strong> ${esc(subrequirement.notCoursesText)}</div>` : ""}
+      </div>
+    </details>
+  `;
+}
+
+function renderStatusBadge(status) {
+  return `<span class="audit-status audit-status-${status}">${esc(statusLabel(status))}</span>`;
+}
+
+function renderMetricList(rows) {
+  if (!rows || !rows.length) return "";
+  const rowsHtml = rows.map(row => {
+    const label = row.label || row.rowType || "Detail";
+    const value = formatMetricRowValue(row);
+    return `
+      <div class="audit-metric-row">
+        <span class="audit-metric-label">${esc(label)}</span>
+        <span class="audit-metric-value">${esc(value)}</span>
+      </div>
+    `;
+  }).join("");
+  return `<div class="audit-preview-card">${rowsHtml}</div>`;
+}
+
+function renderNeedsList(needs) {
+  if (!needs || !needs.length) return "";
+  const needsRows = needs.map(need => {
+    const label = need.label || "Needs";
+    const value = formatNeedsRowValue(need);
+    return `
+      <div class="audit-metric-row">
+        <span class="audit-metric-label">${esc(label)}</span>
+        <span class="audit-metric-value">${esc(value)}</span>
+      </div>
+    `;
+  }).join("");
+  return `<div class="audit-preview-card">${needsRows}</div>`;
+}
+
+function renderCompletedCoursesTable(coursesList) {
+  if (!coursesList || !coursesList.length) return "";
+
+  const rowsHtml = coursesList.map(course => `
+      <tr class="${course.isInProgress ? "audit-course-in-progress" : ""}">
+        <td>${esc(course.term || "")}</td>
+        <td>${esc(course.course || "")}</td>
+        <td>${esc(course.creditText || "")}</td>
+        <td>${esc(course.grade || "")}</td>
+        <td>${esc(course.conditionCode || "")}</td>
+        <td>${esc(course.description || "")}</td>
+      </tr>
+    `).join("");
+
+  return `
+    <div class="audit-preview-card">
+      <div class="audit-preview-subtitle">Completed / In-Progress Courses</div>
+      <table class="audit-course-table">
+        <thead>
+          <tr>
+            <th>Term</th>
+            <th>Course</th>
+            <th>Credit</th>
+            <th>Grade</th>
+            <th>Code</th>
+            <th>Description</th>
+          </tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function formatMetricRowValue(row) {
+  const bits = [];
+  if (row.hoursText) bits.push(`${row.hoursText}${row.hoursLabel ? ` ${row.hoursLabel}` : ""}`.trim());
+  if (row.countText) bits.push(`${row.countText}${row.countLabel ? ` ${row.countLabel}` : ""}`.trim());
+  if (row.subreqsText) bits.push(`${row.subreqsText}${row.subreqsLabel ? ` ${row.subreqsLabel}` : ""}`.trim());
+  if (row.pointsText) bits.push(`${row.pointsText}${row.pointsLabel ? ` ${row.pointsLabel}` : " points"}`.trim());
+  if (row.gpaText) bits.push(`GPA ${row.gpaText}`);
+  if (!bits.length) return row.rawText || "";
+  return bits.join(" | ");
+}
+
+function formatNeedsRowValue(row) {
+  const bits = [];
+  if (row.countText) bits.push(`${row.countText}${row.countLabel ? ` ${row.countLabel}` : ""}`.trim());
+  if (row.hoursText) bits.push(`${row.hoursText}${row.hoursLabel ? ` ${row.hoursLabel}` : ""}`.trim());
+  if (!bits.length) return row.rawText || "";
+  return bits.join(" | ");
 }
 
 async function fetchAuditText(url, init = {}) {
@@ -545,50 +1076,291 @@ function hasChromeStorageLocal() {
 }
 
 async function readCachedAudit() {
-  if (!hasChromeStorageLocal()) {
+  const canUseChromeStorage = hasChromeStorageLocal();
+
+  if (canUseChromeStorage) {
+    try {
+      const stored = await chrome.storage.local.get(DEGREE_AUDIT_CACHE_KEY);
+      const audit = extractCachedAuditPayload(stored[DEGREE_AUDIT_CACHE_KEY]);
+      if (!audit) return null;
+      return { audit, source: "chrome.storage.local" };
+    } catch {
+      pushDegreeAuditDebug("Cache read from chrome.storage.local failed. Trying localStorage fallback.");
+    }
+  } else {
     warnCacheUnavailable();
-    return null;
   }
 
   try {
-    const stored = await chrome.storage.local.get(DEGREE_AUDIT_CACHE_KEY);
-    return stored[DEGREE_AUDIT_CACHE_KEY] || null;
+    const raw = window.localStorage.getItem(DEGREE_AUDIT_LOCAL_STORAGE_KEY);
+    if (!raw) return null;
+    const payload = JSON.parse(raw);
+    const audit = extractCachedAuditPayload(payload);
+    if (!audit) return null;
+    return { audit, source: "localStorage" };
   } catch {
-    pushDegreeAuditDebug("Cache read failed; continuing without cached audit.");
+    pushDegreeAuditDebug("Cache read from localStorage failed; continuing without cached audit.");
     return null;
   }
 }
 
 async function writeCachedAudit(audit) {
-  if (!hasChromeStorageLocal()) {
+  const payload = buildCachedAuditPayload(audit);
+  const canUseChromeStorage = hasChromeStorageLocal();
+
+  if (canUseChromeStorage) {
+    try {
+      await chrome.storage.local.set({ [DEGREE_AUDIT_CACHE_KEY]: payload });
+      return;
+    } catch {
+      pushDegreeAuditDebug("Cache write to chrome.storage.local failed. Trying localStorage fallback.");
+    }
+  } else {
     warnCacheUnavailable();
-    return;
   }
 
   try {
-    await chrome.storage.local.set({ [DEGREE_AUDIT_CACHE_KEY]: audit });
+    window.localStorage.setItem(DEGREE_AUDIT_LOCAL_STORAGE_KEY, JSON.stringify(payload));
   } catch {
-    pushDegreeAuditDebug("Cache write failed; continuing without persistence.");
+    pushDegreeAuditDebug("Cache write to localStorage failed; continuing without persistence.");
   }
 }
 
 async function clearCachedAudit() {
-  if (!hasChromeStorageLocal()) {
+  if (hasChromeStorageLocal()) {
+    try {
+      await chrome.storage.local.remove(DEGREE_AUDIT_CACHE_KEY);
+    } catch {
+      pushDegreeAuditDebug("Cache clear from chrome.storage.local failed; continuing.");
+    }
+  } else {
     warnCacheUnavailable();
-    return;
   }
 
   try {
-    await chrome.storage.local.remove(DEGREE_AUDIT_CACHE_KEY);
+    window.localStorage.removeItem(DEGREE_AUDIT_LOCAL_STORAGE_KEY);
   } catch {
-    pushDegreeAuditDebug("Cache clear failed; continuing.");
+    pushDegreeAuditDebug("Cache clear from localStorage failed; continuing.");
   }
+}
+
+function buildCachedAuditPayload(audit) {
+  return {
+    version: DEGREE_AUDIT_CACHE_VERSION,
+    cachedAt: new Date().toISOString(),
+    audit: {
+      id: audit.id || "",
+      readUrl: audit.readUrl || "",
+      program: audit.program || "",
+      catalogYear: audit.catalogYear || "",
+      createdAt: audit.createdAt || "",
+      format: audit.format || "",
+      fetchedAt: audit.fetchedAt || "",
+      rawHtml: typeof audit.rawHtml === "string" ? audit.rawHtml : "",
+      parsedAudit: audit.parsedAudit && typeof audit.parsedAudit === "object" ? audit.parsedAudit : null,
+    },
+  };
+}
+
+function extractCachedAuditPayload(payload) {
+  if (!payload) return null;
+
+  let candidate = null;
+  if (payload.version === DEGREE_AUDIT_CACHE_VERSION && payload.audit) {
+    candidate = payload.audit;
+  } else if (payload.readUrl || payload.id) {
+    candidate = payload;
+  }
+  if (!candidate) return null;
+
+  const audit = {
+    id: String(candidate.id || ""),
+    readUrl: String(candidate.readUrl || ""),
+    program: cleanText(candidate.program),
+    catalogYear: cleanText(candidate.catalogYear),
+    createdAt: cleanText(candidate.createdAt),
+    format: cleanText(candidate.format),
+    fetchedAt: cleanText(candidate.fetchedAt),
+    rawHtml: typeof candidate.rawHtml === "string" ? candidate.rawHtml : "",
+    parsedAudit: candidate.parsedAudit && typeof candidate.parsedAudit === "object"
+      ? candidate.parsedAudit
+      : null,
+  };
+
+  if (!audit.id || !audit.readUrl) {
+    return null;
+  }
+
+  return audit;
+}
+
+function beginAuditAction(action) {
+  degreeAuditState.isWorking = true;
+  degreeAuditState.activeAction = action;
+  updateAuditButtons();
+}
+
+function endAuditAction() {
+  degreeAuditState.isWorking = false;
+  degreeAuditState.activeAction = null;
+  updateAuditButtons();
+}
+
+function updateAuditButtons() {
+  const isWorking = degreeAuditState.isWorking;
+  degreeAuditEls.fetchBtn.disabled = isWorking;
+  degreeAuditEls.requestBtn.disabled = isWorking;
+
+  degreeAuditEls.fetchBtn.textContent =
+    isWorking && degreeAuditState.activeAction === "fetch"
+      ? "Fetching..."
+      : "Fetch Most Recent Audit";
+  degreeAuditEls.requestBtn.textContent =
+    isWorking && degreeAuditState.activeAction === "request"
+      ? "Working..."
+      : "Request New Audit";
+}
+
+function exposeDegreeAuditApi() {
+  globalThis.getDegreeAuditJson = getDegreeAuditJson;
+  globalThis.sendToRemote = sendToRemote;
+}
+
+function getDegreeAuditJson() {
+  return degreeAuditState.latestAudit?.parsedAudit || null;
+}
+
+async function sendToRemote(apiUrl, options = {}) {
+  if (!degreeAuditState.latestAudit) {
+    const cached = await readCachedAudit();
+    if (cached?.audit) {
+      degreeAuditState.latestAudit = cached.audit;
+    }
+  }
+
+  const audit = degreeAuditState.latestAudit;
+  if (!audit) {
+    throw new Error("No degree audit is loaded. Fetch an audit first.");
+  }
+
+  if (!audit.parsedAudit && audit.rawHtml) {
+    audit.parsedAudit = parseDegreeAuditHtml(audit.rawHtml, audit);
+  }
+  if (!audit.parsedAudit) {
+    throw new Error("No parsed degree audit is available to send.");
+  }
+
+  let url;
+  try {
+    url = new URL(apiUrl);
+  } catch {
+    throw new Error("sendToRemote(apiUrl) requires a valid URL.");
+  }
+  if (url.protocol !== "https:") {
+    throw new Error("sendToRemote(apiUrl) only supports HTTPS URLs.");
+  }
+
+  const method = String(options.method || "POST").toUpperCase();
+  const payload = {
+    sentAt: new Date().toISOString(),
+    descriptor: {
+      id: audit.id,
+      readUrl: audit.readUrl,
+      program: audit.program,
+      catalogYear: audit.catalogYear,
+      createdAt: audit.createdAt,
+      format: audit.format,
+      fetchedAt: audit.fetchedAt,
+    },
+    parsedAudit: audit.parsedAudit,
+    rawAuditHtml: audit.rawHtml || "",
+  };
+
+  const headers = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+  };
+
+  const requestInit = { method, headers };
+  if (method !== "GET" && method !== "HEAD") {
+    requestInit.body = JSON.stringify(payload);
+  }
+
+  pushDegreeAuditDebug(`sendToRemote -> ${url.toString()} (${method})`);
+
+  let response;
+  try {
+    response = await fetch(url.toString(), requestInit);
+  } catch (error) {
+    const message = error?.message || String(error);
+    pushDegreeAuditDebug(`sendToRemote network failure: ${message}`);
+    throw new Error(`sendToRemote failed: ${message}`);
+  }
+
+  const responseText = await response.text();
+  let responseJson = null;
+  try {
+    responseJson = JSON.parse(responseText);
+  } catch {
+    // Response body is not JSON.
+  }
+
+  const result = {
+    ok: response.ok,
+    status: response.status,
+    statusText: response.statusText,
+    url: response.url,
+    responseText,
+    responseJson,
+  };
+
+  if (!response.ok) {
+    pushDegreeAuditDebug(`sendToRemote failed: status=${response.status}`);
+    throw new Error(`sendToRemote failed with status ${response.status}.`);
+  }
+
+  pushDegreeAuditDebug(`sendToRemote succeeded: status=${response.status}`);
+  return result;
+}
+
+function splitHtmlLines(node) {
+  if (!node) return [];
+
+  const html = String(node.innerHTML || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(div|p|li|tr|td|th|h1|h2|h3|h4|h5|h6)>/gi, "\n");
+  const container = document.createElement("div");
+  container.innerHTML = html;
+
+  return String(container.textContent || "")
+    .split("\n")
+    .map(line => cleanText(line))
+    .filter(Boolean);
+}
+
+function normalizeHeaderKey(label) {
+  return String(label || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function parseNumber(value) {
+  if (value == null) return null;
+  const normalized = String(value).replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+  if (!normalized) return null;
+  const num = Number(normalized[0]);
+  return Number.isFinite(num) ? num : null;
+}
+
+function roundToTwo(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 }
 
 function warnCacheUnavailable() {
   if (degreeAuditState.cacheWarningShown) return;
   degreeAuditState.cacheWarningShown = true;
-  pushDegreeAuditDebug("chrome.storage.local is unavailable in this runtime; using in-memory state only.");
+  pushDegreeAuditDebug("chrome.storage.local is unavailable in this runtime; using localStorage fallback.");
 }
 
 async function fetchAuditTextViaExtension(url, init = {}) {
@@ -671,14 +1443,21 @@ function renderDegreeAudit(audit, statusText, isError = false) {
   const metaBits = [audit.createdAt, audit.catalogYear, audit.format].filter(Boolean);
   degreeAuditEls.created.textContent = metaBits.join(" | ");
   degreeAuditEls.openLink.href = audit.readUrl;
-  degreeAuditEls.frame.srcdoc = audit.previewHtml;
+  if (!audit.parsedAudit && audit.rawHtml) {
+    try {
+      audit.parsedAudit = parseDegreeAuditHtml(audit.rawHtml, audit);
+    } catch (error) {
+      pushDegreeAuditDebug(`Audit parse error: ${error?.message || error}`);
+    }
+  }
+  renderDegreeAuditPreview(audit.parsedAudit);
   setDegreeAuditStatus(statusText, isError);
 }
 
 function renderNoAudit(message, isError = false) {
   degreeAuditEls.content.style.display = "none";
   degreeAuditEls.empty.style.display = "block";
-  degreeAuditEls.frame.srcdoc = "";
+  degreeAuditEls.preview.innerHTML = "";
   degreeAuditEls.openLink.href = "#";
   setDegreeAuditStatus(message, isError);
 }
@@ -686,11 +1465,6 @@ function renderNoAudit(message, isError = false) {
 function setDegreeAuditStatus(message, isError = false) {
   degreeAuditEls.status.textContent = message;
   degreeAuditEls.status.style.color = isError ? "#b42318" : "#667085";
-}
-
-function setRequestButtonState(isWorking) {
-  degreeAuditEls.requestBtn.disabled = isWorking;
-  degreeAuditEls.requestBtn.textContent = isWorking ? "Working.." : "Request New Audit";
 }
 
 function getAuditId(readUrl) {

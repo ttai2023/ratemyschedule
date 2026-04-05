@@ -88,9 +88,15 @@ header h1 {
 
 .degree-audit-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.degree-audit-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .degree-audit-status {
@@ -109,6 +115,14 @@ header h1 {
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.degree-audit-btn-secondary {
+  background: #475467;
+}
+
+.degree-audit-btn-secondary:hover:not(:disabled) {
+  background: #344054;
 }
 
 .degree-audit-btn:hover:not(:disabled) {
@@ -168,12 +182,170 @@ header h1 {
   text-decoration: underline;
 }
 
-.degree-audit-frame {
+.degree-audit-preview {
   width: 100%;
-  min-height: 240px;
+  max-height: 360px;
+  overflow: auto;
   border: 1px solid #e2e6f0;
   border-radius: 8px;
-  background: white;
+  background: #f8faff;
+  padding: 8px;
+}
+
+.audit-preview-root {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #101828;
+  font-size: 11px;
+}
+
+.audit-preview-card {
+  background: #ffffff;
+  border: 1px solid #e4e7ec;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.audit-preview-title {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.audit-preview-subtitle {
+  margin-top: 2px;
+  color: #475467;
+}
+
+.audit-completion-text {
+  margin-top: 6px;
+  color: #b42318;
+  font-weight: 600;
+}
+
+.audit-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.audit-summary-item {
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  padding: 6px;
+  background: #ffffff;
+}
+
+.audit-summary-label {
+  display: block;
+  color: #667085;
+}
+
+.audit-summary-value {
+  display: block;
+  margin-top: 2px;
+  font-weight: 700;
+}
+
+.audit-requirement {
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.audit-requirement summary,
+.audit-subrequirement summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+}
+
+.audit-requirement summary::-webkit-details-marker,
+.audit-subrequirement summary::-webkit-details-marker {
+  display: none;
+}
+
+.audit-requirement-body,
+.audit-subrequirement-body {
+  border-top: 1px solid #eaecf0;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.audit-status {
+  display: inline-block;
+  min-width: 22px;
+  text-align: center;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+}
+
+.audit-status-complete { background: #dcfae6; color: #067647; }
+.audit-status-unfulfilled { background: #fee4e2; color: #b42318; }
+.audit-status-in_progress { background: #d1e9ff; color: #175cd3; }
+.audit-status-planned { background: #e9d7fe; color: #7a38a1; }
+.audit-status-none { background: #eaecf0; color: #344054; }
+
+.audit-requirement-title,
+.audit-subrequirement-title {
+  font-weight: 700;
+  flex: 1;
+}
+
+.audit-muted {
+  color: #667085;
+}
+
+.audit-metric-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.audit-metric-label {
+  color: #667085;
+}
+
+.audit-metric-value {
+  text-align: right;
+  font-weight: 600;
+}
+
+.audit-course-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+}
+
+.audit-course-table th,
+.audit-course-table td {
+  border: 1px solid #eaecf0;
+  padding: 4px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.audit-course-table th {
+  background: #f2f4f7;
+}
+
+.audit-course-table .audit-course-in-progress {
+  background: #eff8ff;
+}
+
+.audit-options-block {
+  background: #f9fafb;
+  border: 1px solid #eaecf0;
+  border-radius: 6px;
+  padding: 6px;
+  white-space: pre-wrap;
 }
 
 .degree-audit-debug {

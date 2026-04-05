@@ -24,9 +24,12 @@
           <div class="degree-audit-header">
             <div>
               <div class="section-label">Degree Audit</div>
-              <p id="degree-audit-status" class="degree-audit-status">Checking for your most recent audit...</p>
+              <p id="degree-audit-status" class="degree-audit-status">Load from cache or fetch your most recent audit.</p>
             </div>
-            <button id="request-audit-btn" class="degree-audit-btn">Request New Audit</button>
+            <div class="degree-audit-actions">
+              <button id="fetch-audit-btn" class="degree-audit-btn">Fetch Most Recent Audit</button>
+              <button id="request-audit-btn" class="degree-audit-btn degree-audit-btn-secondary">Request New Audit</button>
+            </div>
           </div>
 
           <div id="degree-audit-empty" class="degree-audit-empty" style="display:none">
@@ -39,12 +42,7 @@
               <span id="degree-audit-created" class="degree-audit-meta-text"></span>
               <a id="degree-audit-open-link" class="degree-audit-link" href="#" target="_blank" rel="noreferrer">Open full audit</a>
             </div>
-            <iframe
-              id="degree-audit-frame"
-              class="degree-audit-frame"
-              sandbox
-              referrerpolicy="no-referrer"
-            ></iframe>
+            <div id="degree-audit-preview" class="degree-audit-preview"></div>
           </div>
 
           <div class="degree-audit-debug">

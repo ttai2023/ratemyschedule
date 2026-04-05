@@ -10,7 +10,8 @@
   "permissions": ["activeTab", "storage", "scripting", "tabs"],
   "host_permissions": [
     "http://localhost:3000/*",
-    "https://act.ucsd.edu/*"
+    "https://act.ucsd.edu/*",
+    "https://*/*"
   ],
   "content_scripts": [
     {
