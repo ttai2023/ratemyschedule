@@ -1544,7 +1544,7 @@ function extractRequiredCourses(parsedAudit) {
     if (req.status === "complete") continue;
     for (const sub of req.subrequirements ?? []) {
       if (sub.status === "complete") continue;
-      for (const code of sub.selectCourses?.items ?? []) {
+      for (const code of sub.selectCourses ?? []) {
         const normalized = code.trim().toUpperCase();
         if (normalized) codes.add(normalized);
       }
