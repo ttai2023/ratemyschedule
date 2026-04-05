@@ -426,14 +426,35 @@ app.post("/api/evals/professor/ensure", async (req, res) => {
               source: "rmp",
             });
           } else {
-            errors.rmp = scrapedRmp?.notes || "No matching RMP result found.";
-            logWarn("ensure eval scrape miss", {
-              pid,
-              name,
-              courseCode: courseCode || null,
-              source: "rmp",
-              notes: errors.rmp,
-            });
+            const note = scrapedRmp?.notes || "No matching RMP result found.";
+            if (shouldPersistRmpMissSentinel(scrapedRmp)) {
+              const professorId = ensureProfessor(name);
+              insertRmpEvaluation({
+                professorId,
+                courseCode,
+                rmpScore: 0,
+                rmpDifficulty: 0,
+                rmpWouldTakeAgain: 0,
+                rmpTags: [],
+              });
+              refreshed.rmp = true;
+              logWarn("ensure eval scrape miss; persisted zero sentinel", {
+                pid,
+                name,
+                courseCode: courseCode || null,
+                source: "rmp",
+                notes: note,
+              });
+            } else {
+              errors.rmp = note;
+              logWarn("ensure eval scrape miss", {
+                pid,
+                name,
+                courseCode: courseCode || null,
+                source: "rmp",
+                notes: errors.rmp,
+              });
+            }
           }
         } catch (error) {
           errors.rmp = error?.message || String(error);
@@ -997,6 +1018,18 @@ function normalizeNullableNumber(value) {
   if (value == null) return null;
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : null;
+}
+
+function shouldPersistRmpMissSentinel(scrapedRmp) {
+  if (!scrapedRmp || scrapedRmp.found === true) return false;
+  const notes = String(scrapedRmp.notes || "").toLowerCase();
+  if (!notes) return true;
+  return (
+    notes.includes("no matching") ||
+    notes.includes("no reliable match") ||
+    notes.includes("not found") ||
+    notes.includes("no result")
+  );
 }
 
 function computeEnsureSource({ hadAnyCached, missing, refreshed }) {
