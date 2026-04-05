@@ -50,6 +50,12 @@ const degreeAuditState = {
   activeAction: null,
   debugLines: [],
   cacheWarningShown: false,
+  authRecovery: {
+    opened: false,
+    tabId: null,
+    openerTabId: null,
+    openerWindowId: null,
+  },
 };
 
 degreeAuditEls.fetchBtn.addEventListener("click", fetchMostRecentAuditManually);
@@ -107,6 +113,7 @@ async function fetchMostRecentAuditManually() {
         await refreshLatestAudit({
           successStatus: "Showing your most recent completed audit.",
         });
+        await finalizeAuthRecoverySuccess();
         if (attempt > 1) {
           pushDegreeAuditDebug(`Manual fetch recovered on retry ${attempt}/${maxAttempts}.`);
         }
@@ -152,10 +159,28 @@ async function openAuditCreatePageForAuthRecovery(attemptNumber) {
   pushDegreeAuditDebug(
     `Opening DARS create page to refresh auth session (retry ${attemptNumber}/${DEGREE_AUDIT_AUTH_RECOVERY_RETRIES}).`
   );
+  degreeAuditState.authRecovery.opened = true;
+  degreeAuditState.authRecovery.tabId = null;
+  degreeAuditState.authRecovery.openerTabId = null;
+  degreeAuditState.authRecovery.openerWindowId = null;
+
+  try {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (activeTab?.id != null) {
+      degreeAuditState.authRecovery.openerTabId = activeTab.id;
+      degreeAuditState.authRecovery.openerWindowId = activeTab.windowId ?? null;
+    }
+  } catch (error) {
+    pushDegreeAuditDebug(`Could not record opener tab before auth recovery: ${error?.message || error}`);
+  }
 
   if (chrome?.tabs?.create) {
     try {
-      await chrome.tabs.create({ url: DARS_CREATE_URL, active: true });
+      const createdTab = await chrome.tabs.create({ url: DARS_CREATE_URL, active: true });
+      degreeAuditState.authRecovery.tabId = createdTab?.id ?? null;
+      if (createdTab?.id != null) {
+        pushDegreeAuditDebug(`Opened auth recovery tab ${createdTab.id}.`);
+      }
       return;
     } catch (error) {
       pushDegreeAuditDebug(`chrome.tabs.create failed: ${error?.message || error}`);
@@ -165,6 +190,71 @@ async function openAuditCreatePageForAuthRecovery(attemptNumber) {
   const openedWindow = window.open(DARS_CREATE_URL, "_blank", "noopener,noreferrer");
   if (!openedWindow) {
     pushDegreeAuditDebug("Could not open DARS create page automatically (popup may have been blocked).");
+  }
+}
+
+async function finalizeAuthRecoverySuccess() {
+  const recovery = degreeAuditState.authRecovery;
+  if (!recovery.opened) return;
+
+  recovery.opened = false;
+
+  if (recovery.tabId != null && chrome?.tabs?.remove) {
+    try {
+      await chrome.tabs.remove(recovery.tabId);
+      pushDegreeAuditDebug(`Closed auth recovery tab ${recovery.tabId}.`);
+    } catch (error) {
+      pushDegreeAuditDebug(`Could not close auth recovery tab ${recovery.tabId}: ${error?.message || error}`);
+    }
+  }
+
+  if (recovery.openerWindowId != null && chrome?.windows?.update) {
+    try {
+      await chrome.windows.update(recovery.openerWindowId, { focused: true });
+    } catch (error) {
+      pushDegreeAuditDebug(`Could not focus opener window ${recovery.openerWindowId}: ${error?.message || error}`);
+    }
+  }
+
+  if (recovery.openerTabId != null && chrome?.tabs?.update) {
+    try {
+      await chrome.tabs.update(recovery.openerTabId, { active: true });
+      pushDegreeAuditDebug(`Returned to opener tab ${recovery.openerTabId}.`);
+    } catch (error) {
+      pushDegreeAuditDebug(`Could not activate opener tab ${recovery.openerTabId}: ${error?.message || error}`);
+    }
+  }
+
+  await reopenExtensionPopupBestEffort();
+  recovery.tabId = null;
+  recovery.openerTabId = null;
+  recovery.openerWindowId = null;
+}
+
+async function reopenExtensionPopupBestEffort() {
+  if (chrome?.action?.openPopup) {
+    try {
+      await chrome.action.openPopup();
+      pushDegreeAuditDebug("Re-opened extension action popup.");
+      return;
+    } catch (error) {
+      pushDegreeAuditDebug(`chrome.action.openPopup failed: ${error?.message || error}`);
+    }
+  }
+
+  if (chrome?.windows?.create) {
+    try {
+      await chrome.windows.create({
+        url: chrome.runtime.getURL("popup/popup.html"),
+        type: "popup",
+        width: 460,
+        height: 760,
+        focused: true,
+      });
+      pushDegreeAuditDebug("Opened extension popup fallback window.");
+    } catch (error) {
+      pushDegreeAuditDebug(`Could not open popup fallback window: ${error?.message || error}`);
+    }
   }
 }
 
