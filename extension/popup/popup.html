@@ -20,6 +20,38 @@
 
       <!-- Course Selection -->
       <section id="tab-courses" class="tab-panel active">
+        <section id="degree-audit-panel" class="degree-audit-panel">
+          <div class="degree-audit-header">
+            <div>
+              <div class="section-label">Degree Audit</div>
+              <p id="degree-audit-status" class="degree-audit-status">Checking for your most recent audit...</p>
+            </div>
+            <button id="request-audit-btn" class="degree-audit-btn">Request New Audit</button>
+          </div>
+
+          <div id="degree-audit-empty" class="degree-audit-empty" style="display:none">
+            No completed audits found yet.
+          </div>
+
+          <div id="degree-audit-content" class="degree-audit-content" style="display:none">
+            <div class="degree-audit-meta">
+              <span id="degree-audit-program" class="degree-audit-pill"></span>
+              <span id="degree-audit-created" class="degree-audit-meta-text"></span>
+              <a id="degree-audit-open-link" class="degree-audit-link" href="#" target="_blank" rel="noreferrer">Open full audit</a>
+            </div>
+            <iframe
+              id="degree-audit-frame"
+              class="degree-audit-frame"
+              sandbox
+              referrerpolicy="no-referrer"
+            ></iframe>
+          </div>
+
+          <div class="degree-audit-debug">
+            <div class="section-label">Audit Debug</div>
+            <pre id="degree-audit-debug-log" class="degree-audit-debug-log">Waiting for audit activity...</pre>
+          </div>
+        </section>
 
         <!-- Profile -->
         <div class="profile-row">

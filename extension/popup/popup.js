@@ -21,6 +21,690 @@ function esc(s) {
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+const DARS_BASE_URL = "https://act.ucsd.edu/studentDarsSelfservice/audit/";
+const DARS_LIST_URL = new URL("list.html", DARS_BASE_URL).toString();
+const DARS_CREATE_URL = new URL("create.html", DARS_BASE_URL).toString();
+const DEGREE_AUDIT_CACHE_KEY = "degreeAudit.latest";
+const DEGREE_AUDIT_DEBUG_LIMIT = 18;
+
+const degreeAuditEls = {
+  status: document.getElementById("degree-audit-status"),
+  empty: document.getElementById("degree-audit-empty"),
+  content: document.getElementById("degree-audit-content"),
+  program: document.getElementById("degree-audit-program"),
+  created: document.getElementById("degree-audit-created"),
+  openLink: document.getElementById("degree-audit-open-link"),
+  frame: document.getElementById("degree-audit-frame"),
+  requestBtn: document.getElementById("request-audit-btn"),
+  debugLog: document.getElementById("degree-audit-debug-log"),
+};
+
+const degreeAuditState = {
+  latestAudit: null,
+  isWorking: false,
+  debugLines: [],
+  cacheWarningShown: false,
+};
+
+degreeAuditEls.requestBtn.addEventListener("click", requestNewAudit);
+initializeDegreeAudit();
+
+async function initializeDegreeAudit() {
+  pushDegreeAuditDebug("Popup opened. Starting degree audit bootstrap.");
+  await renderCachedAudit();
+  await refreshLatestAudit();
+}
+
+async function renderCachedAudit() {
+  const cachedAudit = await readCachedAudit();
+  if (!cachedAudit) return;
+
+  degreeAuditState.latestAudit = cachedAudit;
+  pushDegreeAuditDebug(`Loaded cached audit ${cachedAudit.id || "(unknown id)"}.`);
+  renderDegreeAudit(cachedAudit, "Loaded your cached audit.");
+}
+
+async function refreshLatestAudit() {
+  setDegreeAuditStatus("Checking for your most recent audit...");
+  pushDegreeAuditDebug("Refreshing latest audit from manage audits.");
+
+  try {
+    const latestDescriptor = await fetchLatestAuditDescriptor();
+    if (!latestDescriptor) {
+      degreeAuditState.latestAudit = null;
+      renderNoAudit("No completed audits found yet.");
+      await clearCachedAudit();
+      pushDegreeAuditDebug("Manage audits returned no completed audit rows.");
+      return;
+    }
+
+    if (degreeAuditState.latestAudit?.id === latestDescriptor.id) {
+      renderDegreeAudit(
+        degreeAuditState.latestAudit,
+        "Showing your most recent completed audit."
+      );
+      return;
+    }
+
+    const hydratedAudit = await hydrateAudit(latestDescriptor);
+    renderDegreeAudit(hydratedAudit, "Showing your most recent completed audit.");
+    await writeCachedAudit(hydratedAudit);
+    pushDegreeAuditDebug(`Latest audit ready: ${hydratedAudit.id}.`);
+  } catch (error) {
+    const message = error?.message || "Could not load degree audits.";
+    pushDegreeAuditDebug(`Refresh failed: ${message}`);
+    if (degreeAuditState.latestAudit) {
+      renderDegreeAudit(
+        degreeAuditState.latestAudit,
+        `${message} Showing the cached audit instead.`,
+        true
+      );
+      return;
+    }
+
+    renderNoAudit(message, true);
+  }
+}
+
+async function requestNewAudit() {
+  if (degreeAuditState.isWorking) return;
+
+  degreeAuditState.isWorking = true;
+  setRequestButtonState(true);
+  setDegreeAuditStatus("Working.. requesting a new degree audit.");
+  pushDegreeAuditDebug("Requesting a new degree audit.");
+
+  try {
+    const previousAudit = await fetchLatestAuditDescriptor();
+    pushDegreeAuditDebug(
+      previousAudit
+        ? `Previous latest audit: ${previousAudit.id}.`
+        : "No previous audit found before request."
+    );
+    const requestDetails = await buildAuditRequest();
+
+    await fetchAuditText(requestDetails.actionUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: requestDetails.params.toString(),
+    });
+
+    const latestAudit = await pollForNewAudit(previousAudit?.id ?? null);
+    if (!latestAudit) {
+      throw new Error("Audit request started, but the new audit did not finish in time.");
+    }
+
+    renderDegreeAudit(latestAudit, "New degree audit is ready.");
+    await writeCachedAudit(latestAudit);
+    pushDegreeAuditDebug(`New audit completed: ${latestAudit.id}.`);
+  } catch (error) {
+    const message = error?.message || "Could not request a new audit.";
+    pushDegreeAuditDebug(`Request failed: ${message}`);
+    setDegreeAuditStatus(message, true);
+  } finally {
+    degreeAuditState.isWorking = false;
+    setRequestButtonState(false);
+  }
+}
+
+async function buildAuditRequest() {
+  pushDegreeAuditDebug("Loading create.html to build the audit request.");
+  const createHtml = await fetchAuditText(DARS_CREATE_URL);
+  const doc = new DOMParser().parseFromString(createHtml, "text/html");
+  const form = doc.querySelector('form[name="auditRequest"]');
+
+  if (!form) {
+    throw new Error("Could not find the degree audit request form.");
+  }
+
+  const params = serializeForm(form);
+
+  if (params.has("auditTemplate")) {
+    params.set("auditTemplate", "htm!!!!htm");
+  }
+
+  if (params.has("useDefaultDegreePrograms")) {
+    params.set("useDefaultDegreePrograms", "true");
+  }
+
+  const actionUrl = new URL(form.getAttribute("action") || "create.html", DARS_BASE_URL).toString();
+  pushDegreeAuditDebug(`Prepared POST payload with ${Array.from(params.keys()).length} fields.`);
+  return { actionUrl, params };
+}
+
+function serializeForm(form) {
+  const params = new URLSearchParams();
+  const fields = form.querySelectorAll("input, select, textarea");
+
+  fields.forEach(field => {
+    if (!field.name || field.disabled) return;
+
+    const tag = field.tagName.toLowerCase();
+    const type = (field.type || "").toLowerCase();
+
+    if ((type === "checkbox" || type === "radio") && !field.checked) {
+      return;
+    }
+
+    if (tag === "select" && field.multiple) {
+      Array.from(field.selectedOptions).forEach(option => {
+        params.append(field.name, option.value);
+      });
+      return;
+    }
+
+    params.append(field.name, field.value ?? "");
+  });
+
+  return params;
+}
+
+async function pollForNewAudit(previousAuditId) {
+  const attempts = 15;
+  const delayMs = 2000;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      await wait(delayMs);
+    }
+
+    setDegreeAuditStatus(`Working.. waiting for the new audit (${attempt + 1}/${attempts}).`);
+    const latestDescriptor = await fetchLatestAuditDescriptor();
+
+    if (!latestDescriptor) {
+      pushDegreeAuditDebug(`Poll ${attempt + 1}: no audits visible yet.`);
+      continue;
+    }
+
+    if (latestDescriptor.id !== previousAuditId) {
+      pushDegreeAuditDebug(`Poll ${attempt + 1}: found new audit ${latestDescriptor.id}.`);
+      return hydrateAudit(latestDescriptor);
+    }
+
+    pushDegreeAuditDebug(`Poll ${attempt + 1}: latest audit is still ${latestDescriptor.id}.`);
+  }
+
+  return null;
+}
+
+async function fetchLatestAuditDescriptor() {
+  pushDegreeAuditDebug(`Fetching manage audits from ${DARS_LIST_URL}.`);
+  const listHtml = await fetchAuditText(DARS_LIST_URL);
+  return parseLatestAuditDescriptor(listHtml);
+}
+
+async function hydrateAudit(descriptor) {
+  pushDegreeAuditDebug(`Fetching full audit HTML from ${descriptor.readUrl}.`);
+  const auditHtml = await fetchAuditText(descriptor.readUrl);
+  const previewHtml = buildAuditPreview(auditHtml);
+
+  const hydrated = {
+    ...descriptor,
+    previewHtml,
+    fetchedAt: new Date().toISOString(),
+  };
+
+  degreeAuditState.latestAudit = hydrated;
+  return hydrated;
+}
+
+function parseLatestAuditDescriptor(listHtml) {
+  const doc = new DOMParser().parseFromString(listHtml, "text/html");
+  const row = Array.from(doc.querySelectorAll("table.resultList tr")).find(candidate =>
+    candidate.querySelector('a[href*="read.html?id="]')
+  );
+
+  if (!row) {
+    return null;
+  }
+
+  const cells = row.querySelectorAll("td");
+  const link = row.querySelector('a[href*="read.html?id="]');
+  const readUrl = new URL(link.getAttribute("href"), DARS_LIST_URL).toString();
+
+  pushDegreeAuditDebug(
+    `Parsed latest audit row: program=${cleanText(cells[2]?.textContent) || "(unknown)"} id=${getAuditId(readUrl)}.`
+  );
+
+  return {
+    id: getAuditId(readUrl),
+    readUrl,
+    program: cleanText(cells[2]?.textContent),
+    catalogYear: cleanText(cells[3]?.textContent),
+    createdAt: cleanText(cells[4]?.textContent),
+    format: cleanText(cells[6]?.textContent),
+  };
+}
+
+function buildAuditPreview(auditHtml) {
+  const doc = new DOMParser().parseFromString(auditHtml, "text/html");
+  doc.querySelectorAll("script, style, link, noscript").forEach(node => node.remove());
+
+  const main = doc.querySelector("#main") || doc.body;
+  const cloned = main.cloneNode(true);
+  cloned.querySelectorAll("a").forEach(link => {
+    link.setAttribute("target", "_blank");
+    link.setAttribute("rel", "noreferrer");
+  });
+
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <base href="${DARS_BASE_URL}">
+    <style>
+      body {
+        margin: 0;
+        padding: 12px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 12px;
+        line-height: 1.45;
+        color: #1a1a2e;
+        background: white;
+      }
+
+      h1, h2, h3, h4 {
+        color: #2c3e7a;
+        margin: 0 0 8px;
+      }
+
+      p, ul, ol, table {
+        margin: 0 0 10px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th, td {
+        border: 1px solid #d0d5e8;
+        padding: 6px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        background: #f5f7ff;
+      }
+
+      a {
+        color: #2c3e7a;
+      }
+
+      .btn, button, input, select, textarea {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>${cloned.innerHTML}</body>
+</html>`;
+}
+
+async function fetchAuditText(url, init = {}) {
+  const method = init.method || "GET";
+  pushDegreeAuditDebug(`${method} ${url}`);
+
+  const auditTab = await findAuditCapableTab();
+  if (auditTab?.id != null) {
+    pushDegreeAuditDebug(`Using UCSD tab ${auditTab.id} (${auditTab.url || "no url"}) for first-party fetch.`);
+    const tabErrors = [];
+    const canScript = hasScriptingApi();
+
+    if (canScript) {
+      try {
+        const mainWorldResult = await fetchAuditTextViaMainWorld(auditTab.id, url, init);
+        return validateAuditResponse(mainWorldResult, { url, method, source: "tab-main" });
+      } catch (error) {
+        const message = error?.message || String(error);
+        tabErrors.push(`main-world: ${message}`);
+        pushDegreeAuditDebug(`Main-world fetch failed: ${message}`);
+      }
+    } else {
+      pushDegreeAuditDebug("Skipping main-world fetch because chrome.scripting is unavailable in this runtime.");
+    }
+
+    try {
+      const bridgeResult = await fetchAuditTextViaBridge(auditTab.id, url, init);
+      return validateAuditResponse(bridgeResult, { url, method, source: "tab-bridge" });
+    } catch (error) {
+      const message = error?.message || String(error);
+      tabErrors.push(`bridge: ${message}`);
+      pushDegreeAuditDebug(`Content bridge fetch failed: ${message}`);
+    }
+
+    try {
+      pushDegreeAuditDebug("Trying popup-origin fetch as a final fallback.");
+      const extensionResult = await fetchAuditTextViaExtension(url, init);
+      return validateAuditResponse(extensionResult, { url, method, source: "popup-fallback" });
+    } catch (error) {
+      const message = error?.message || String(error);
+      tabErrors.push(`popup-fallback: ${message}`);
+      pushDegreeAuditDebug(`Popup fallback fetch failed: ${message}`);
+    }
+
+    throw new Error(`Could not fetch audit data from the signed-in UCSD tab (${tabErrors.join(" | ")}).`);
+  }
+
+  pushDegreeAuditDebug(
+    "No UCSD tab found. Falling back to popup fetch; auth cookies may be blocked by SameSite."
+  );
+  const extensionResult = await fetchAuditTextViaExtension(url, init);
+  return validateAuditResponse(extensionResult, { url, method, source: "popup" });
+}
+
+async function findAuditCapableTab() {
+  const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const activeMatch = activeTabs.find(tab => isUcsdTab(tab));
+  if (activeMatch) {
+    return activeMatch;
+  }
+
+  const matchingTabs = await chrome.tabs.query({ url: ["https://act.ucsd.edu/*"] });
+  return matchingTabs.find(tab => isUcsdTab(tab)) || null;
+}
+
+function isUcsdTab(tab) {
+  return Boolean(tab?.id) && /^https:\/\/act\.ucsd\.edu\//i.test(tab.url || "");
+}
+
+async function fetchAuditTextViaBridge(tabId, url, init = {}) {
+  const payload = {
+    type: "degreeAuditFetch",
+    url,
+    method: init.method || "GET",
+    headers: init.headers || {},
+    body: init.body || null,
+  };
+
+  try {
+    const result = await sendMessageToTab(tabId, payload);
+
+    if (!result) {
+      throw new Error("Content bridge returned no result.");
+    }
+
+    return result;
+  } catch (error) {
+    const errorMessage = String(error?.message || error);
+    if (/Receiving end does not exist|Could not establish connection/i.test(errorMessage)) {
+      if (!hasScriptingApi()) {
+        throw new Error(
+          "Content bridge not loaded in the UCSD tab. Reload that act.ucsd.edu tab once, then retry."
+        );
+      }
+
+      pushDegreeAuditDebug("Content bridge missing in tab. Injecting bridge script and retrying.");
+      await injectAuditBridge(tabId);
+      const retryResult = await sendMessageToTab(tabId, payload);
+      if (!retryResult) {
+        throw new Error("Content bridge returned no result after reinjection.");
+      }
+      return retryResult;
+    }
+
+    throw new Error(`Could not run audit fetch inside the UCSD tab: ${errorMessage}`);
+  }
+}
+
+async function fetchAuditTextViaMainWorld(tabId, url, init = {}) {
+  let injectionResults;
+  try {
+    injectionResults = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [
+        {
+          url,
+          method: init.method || "GET",
+          headers: init.headers || {},
+          body: init.body || null,
+        },
+      ],
+      func: async request => {
+        try {
+          const response = await fetch(request.url, {
+            method: request.method || "GET",
+            headers: request.headers || {},
+            body: request.body || null,
+            credentials: "include",
+            redirect: "follow",
+          });
+          const text = await response.text();
+          const titleMatch = text.match(/<title[^>]*>([^<]*)<\/title>/i);
+
+          return {
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            url: response.url,
+            redirected: response.redirected,
+            text,
+            title: titleMatch ? titleMatch[1] : "",
+            source: "main-world",
+          };
+        } catch (error) {
+          return {
+            ok: false,
+            networkError: String(error),
+            url: request.url,
+            source: "main-world",
+          };
+        }
+      },
+    });
+  } catch (error) {
+    throw new Error(`Could not execute main-world audit fetch: ${error?.message || error}`);
+  }
+
+  const result = injectionResults?.[0]?.result;
+  if (!result) {
+    throw new Error("Main-world fetch returned no result.");
+  }
+
+  return result;
+}
+
+async function injectAuditBridge(tabId) {
+  if (!hasScriptingApi()) {
+    throw new Error("chrome.scripting is unavailable, so the content bridge cannot be injected.");
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["ucsd-content.js"],
+    });
+  } catch (error) {
+    throw new Error(`Could not inject content bridge: ${error?.message || error}`);
+  }
+}
+
+function sendMessageToTab(tabId, message) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, response => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message));
+        return;
+      }
+
+      resolve(response);
+    });
+  });
+}
+
+function hasScriptingApi() {
+  return Boolean(chrome?.scripting?.executeScript);
+}
+
+function hasChromeStorageLocal() {
+  return Boolean(chrome?.storage?.local);
+}
+
+async function readCachedAudit() {
+  if (!hasChromeStorageLocal()) {
+    warnCacheUnavailable();
+    return null;
+  }
+
+  try {
+    const stored = await chrome.storage.local.get(DEGREE_AUDIT_CACHE_KEY);
+    return stored[DEGREE_AUDIT_CACHE_KEY] || null;
+  } catch {
+    pushDegreeAuditDebug("Cache read failed; continuing without cached audit.");
+    return null;
+  }
+}
+
+async function writeCachedAudit(audit) {
+  if (!hasChromeStorageLocal()) {
+    warnCacheUnavailable();
+    return;
+  }
+
+  try {
+    await chrome.storage.local.set({ [DEGREE_AUDIT_CACHE_KEY]: audit });
+  } catch {
+    pushDegreeAuditDebug("Cache write failed; continuing without persistence.");
+  }
+}
+
+async function clearCachedAudit() {
+  if (!hasChromeStorageLocal()) {
+    warnCacheUnavailable();
+    return;
+  }
+
+  try {
+    await chrome.storage.local.remove(DEGREE_AUDIT_CACHE_KEY);
+  } catch {
+    pushDegreeAuditDebug("Cache clear failed; continuing.");
+  }
+}
+
+function warnCacheUnavailable() {
+  if (degreeAuditState.cacheWarningShown) return;
+  degreeAuditState.cacheWarningShown = true;
+  pushDegreeAuditDebug("chrome.storage.local is unavailable in this runtime; using in-memory state only.");
+}
+
+async function fetchAuditTextViaExtension(url, init = {}) {
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      redirect: "follow",
+      ...init,
+    });
+
+    const text = await response.text();
+    const title = new DOMParser()
+      .parseFromString(text, "text/html")
+      .querySelector("title")?.textContent || "";
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      url: response.url,
+      redirected: response.redirected,
+      text,
+      title,
+    };
+  } catch (error) {
+    throw new Error(`Popup fetch failed: ${error.message || error}`);
+  }
+}
+
+function validateAuditResponse(result, context) {
+  if (result.networkError) {
+    pushDegreeAuditDebug(`${context.source} fetch network error: ${result.networkError}`);
+    throw new Error(result.networkError);
+  }
+
+  pushDegreeAuditDebug(
+    `${context.source} fetch response: status=${result.status || "?"} redirected=${Boolean(result.redirected)} finalUrl=${result.url || "(none)"}`
+  );
+
+  if (result.title) {
+    pushDegreeAuditDebug(`${context.source} response title: ${result.title}`);
+  }
+
+  if (!result.ok) {
+    throw new Error(`Degree audit request failed (${result.status || "unknown"}).`);
+  }
+
+  if (result.redirected && !String(result.url || "").includes("/studentDarsSelfservice/")) {
+    throw new Error("Please sign in to UCSD in an act.ucsd.edu tab first.");
+  }
+
+  if (
+    /login|single sign on|sign in/i.test(result.title || "") &&
+    !String(result.url || "").includes("/studentDarsSelfservice/")
+  ) {
+    throw new Error("Please sign in to UCSD in an act.ucsd.edu tab first.");
+  }
+
+  return result.text;
+}
+
+function pushDegreeAuditDebug(message) {
+  const timestamp = new Date().toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  degreeAuditState.debugLines.push(`[${timestamp}] ${message}`);
+  if (degreeAuditState.debugLines.length > DEGREE_AUDIT_DEBUG_LIMIT) {
+    degreeAuditState.debugLines.splice(0, degreeAuditState.debugLines.length - DEGREE_AUDIT_DEBUG_LIMIT);
+  }
+  degreeAuditEls.debugLog.textContent = degreeAuditState.debugLines.join("\n");
+}
+
+function renderDegreeAudit(audit, statusText, isError = false) {
+  degreeAuditEls.empty.style.display = "none";
+  degreeAuditEls.content.style.display = "flex";
+  degreeAuditEls.program.textContent = audit.program || "Latest Audit";
+
+  const metaBits = [audit.createdAt, audit.catalogYear, audit.format].filter(Boolean);
+  degreeAuditEls.created.textContent = metaBits.join(" | ");
+  degreeAuditEls.openLink.href = audit.readUrl;
+  degreeAuditEls.frame.srcdoc = audit.previewHtml;
+  setDegreeAuditStatus(statusText, isError);
+}
+
+function renderNoAudit(message, isError = false) {
+  degreeAuditEls.content.style.display = "none";
+  degreeAuditEls.empty.style.display = "block";
+  degreeAuditEls.frame.srcdoc = "";
+  degreeAuditEls.openLink.href = "#";
+  setDegreeAuditStatus(message, isError);
+}
+
+function setDegreeAuditStatus(message, isError = false) {
+  degreeAuditEls.status.textContent = message;
+  degreeAuditEls.status.style.color = isError ? "#b42318" : "#667085";
+}
+
+function setRequestButtonState(isWorking) {
+  degreeAuditEls.requestBtn.disabled = isWorking;
+  degreeAuditEls.requestBtn.textContent = isWorking ? "Working.." : "Request New Audit";
+}
+
+function getAuditId(readUrl) {
+  return new URL(readUrl).searchParams.get("id") || readUrl;
+}
+
+function cleanText(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // ── Search ─────────────────────────────────────────────────────
 document.getElementById("search-btn").addEventListener("click", runSearch);
 document.getElementById("course-search").addEventListener("keydown", e => {
