@@ -1,0 +1,45 @@
+{
+    "ECE":
+    {
+        "101": {
+            "A00": {
+                "Lecture": {
+                    "Days": [2,4],
+                    "Time": {
+                        "Start": {
+                            "Hour": 10,
+                            "Minute": 0
+                        },
+                        "End": {
+                            "Hour": 11,
+                            "Minute": 20
+                        }
+                    }
+                },
+                "Discussion": {
+
+                },
+                "Lab": {
+
+                },
+                "Final": {
+
+                }
+            },
+            "A01": {
+                "Lecture": {
+
+                },
+                "Discussion": {
+
+                },
+                "Lab": {
+
+                },
+                "Final": {
+
+                }
+            }
+        }
+    }
+}

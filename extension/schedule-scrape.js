@@ -18,11 +18,6 @@ async function scrapeSchedule(courseName, courseCode, termCode) {
     const j = await response.json();
 }
 
-// test in readline
-import * as readline from "readline";
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-rl.question("Enter course name, code, and term code (comma separated): ", async (answer) => {
-  const [courseName, courseCode, termCode] = answer.split(",").map(s => s.trim());
-  let schedule = await scrapeSchedule(courseName, courseCode, termCode);
-  console.log(schedule);
-});
+
+
+export { scrapeSchedule };
