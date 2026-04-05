@@ -2585,7 +2585,7 @@ function getCurrentWeights() {
   const w = {};
   items.forEach((item, i) => {
     const key = item.dataset.id;   // "professor" | "time" | "finals" | "days" | "difficulty"
-    if (key) w[key] = vals[i];
+    if (key) w[key] = vals[i] / 100; // convert to 0–1 range
   });
   return w;
 }
@@ -3122,23 +3122,34 @@ function renderCalendar(schedule) {
     }
 
     schedule.sections.forEach(sec => {
-      if (!sec.days.includes(d)) return;
-      const startM = timeMins(sec.start);
-      const endM   = timeMins(sec.end);
-      const top    = (startM - CAL_START * 60) * PX_PER_MIN;
-      const height = Math.max((endM - startM) * PX_PER_MIN, 22);
-      const clr    = COURSE_COLORS[sec.colorIdx % COURSE_COLORS.length];
+      const meetings = sec.meetings && sec.meetings.length
+        ? sec.meetings
+        : [{ days: sec.days, start: sec.start, end: sec.end }];
 
-      const ev = document.createElement("div");
-      ev.className = "cal-event-block";
-      ev.style.cssText =
-        `top:${top}px;height:${height}px;` +
-        `background:${clr.bg};border-left:3px solid ${clr.border};color:${clr.text}`;
-      ev.innerHTML =
-        `<div class="ev-code">${esc(sec.code)}</div>` +
-        `<div class="ev-time">${fmtTime(sec.start)}–${fmtTime(sec.end)}</div>`;
-      ev.addEventListener("click", () => showSectionDetail(sec, clr));
-      col.appendChild(ev);
+      meetings.forEach(meeting => {
+        const meetingDays = typeof meeting.days === "string"
+          ? expandDaysJS(meeting.days).map(day => DAY_TO_COL[day]).filter(Boolean)
+          : meeting.days || [];
+
+        if (!meetingDays.includes(d)) return;
+
+        const startM = timeMins(meeting.start);
+        const endM   = timeMins(meeting.end);
+        const top    = (startM - CAL_START * 60) * PX_PER_MIN;
+        const height = Math.max((endM - startM) * PX_PER_MIN, 22);
+        const clr    = COURSE_COLORS[sec.colorIdx % COURSE_COLORS.length];
+
+        const ev = document.createElement("div");
+        ev.className = "cal-event-block";
+        ev.style.cssText =
+          `top:${top}px;height:${height}px;` +
+          `background:${clr.bg};border-left:3px solid ${clr.border};color:${clr.text}`;
+        ev.innerHTML =
+          `<div class="ev-code">${esc(sec.code)}</div>` +
+          `<div class="ev-time">${fmtTime(meeting.start)}–${fmtTime(meeting.end)}</div>`;
+        ev.addEventListener("click", () => showSectionDetail(sec, clr));
+        col.appendChild(ev);
+      });
     });
 
     body.appendChild(col);
@@ -3222,28 +3233,22 @@ function syncPassLists() {
 document.getElementById("assign-pass-btn").addEventListener("click", autoAssignPasses);
 
 function autoAssignPasses() {
-  // Build from active schedule sections if available, else from courses list
-  const source = activeSchedules.length > 0
-    ? activeSchedules[currentScheduleIdx].sections.map((s, i) => ({ code: s.code, name: s.name, colorIdx: s.colorIdx ?? i }))
-    : courses.map((c, i) => ({ code: c.code, name: c.name || c.code, colorIdx: i }));
-
-  if (!source.length) {
-    alert("Add courses first, or run Analyze on the Results tab.");
+  const sched = activeSchedules[currentScheduleIdx];
+  if (!sched?.passes) {
+    alert("Generate schedules first.");
     return;
   }
 
-  passAssignments = source.map((s, i) => {
-    // Use real seats_available if we have it from the API, else fall back to PASS_META
-    const realSeats  = s.seats_available;
-    const hasMeta    = realSeats != null;
-    const seats      = hasMeta ? realSeats : (PASS_META[s.code]?.seats ?? defaultMeta(s.code, i).seats);
-    const difficulty = seats <= 15 ? "Hard" : seats <= 35 ? "Medium" : "Easy";
-    const reason     = hasMeta
-      ? `${seats} seat${seats !== 1 ? "s" : ""} available`
-      : (PASS_META[s.code]?.reason ?? defaultMeta(s.code, i).reason);
-    const autoPass   = difficulty === "Hard" || seats < 30 ? "first" : "second";
-    return { ...s, seats, difficulty, reason, pass: autoPass };
-  });
+  passAssignments = sched.passes.details.map((d, i) => ({
+    code: d.courseCode,
+    name: d.courseCode,
+    colorIdx: i % COURSE_COLORS.length,
+    seats: d.seats_available,
+    difficulty: d.enrollmentDifficulty.charAt(0).toUpperCase()
+      + d.enrollmentDifficulty.slice(1),
+    reason: d.reason,
+    pass: d.pass,  // "first" or "second" — already computed
+  }));
 
   renderPassColumns();
 }
