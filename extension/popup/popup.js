@@ -10,10 +10,25 @@ document.querySelectorAll(".tab").forEach(tab => {
 
 // ── Course Selection ───────────────────────────────────────────
 const API_BASE = "http://localhost:3001";
+const DEFAULT_TERM_CODE = "S126";
+const WEBREG_BASE_URL = "https://act.ucsd.edu/webreg2/svc/wradapter/secure";
 
 // courses: array of { code, name, units, instructors: [{name, rmp}] }
 const courses = [];
 const completedCourses = [];
+const webregCache = {
+  termCourseSet: new Map(),
+  prerequisites: new Map(),
+  loadGroupData: new Map(),
+  evals: new Map(),
+};
+const browserUseProfileState = {
+  hasProfile: false,
+  setupStatus: "missing",
+  signedInConfirmed: false,
+  profileId: null,
+  lastError: null,
+};
 
 function esc(s) {
   return String(s ?? "")
@@ -61,6 +76,39 @@ const degreeAuditState = {
 degreeAuditEls.fetchBtn.addEventListener("click", fetchMostRecentAuditManually);
 degreeAuditEls.requestBtn.addEventListener("click", requestNewAudit);
 initializeDegreeAudit();
+initializeWebRegControls();
+
+function initializeWebRegControls() {
+  const termInput = document.getElementById("termcode-input");
+  if (termInput && !termInput.value) {
+    termInput.value = DEFAULT_TERM_CODE;
+  }
+
+  void (async () => {
+    const detected = await detectTermCodeFromActiveWebReg();
+    if (detected) {
+      setTermCodeValue(detected);
+      pushDegreeAuditDebug(`Detected term code ${detected} from WebReg tab.`);
+    }
+  })();
+
+  const detectBtn = document.getElementById("detect-term-btn");
+  if (detectBtn) {
+    detectBtn.addEventListener("click", async () => {
+      const detected = await detectTermCodeFromActiveWebReg();
+      if (detected) {
+        setTermCodeValue(detected);
+        document.getElementById("audit-courses-status").textContent = `Detected term ${detected}.`;
+        if (degreeAuditState.latestAudit?.parsedAudit) {
+          await populateCoursesFromAudit(degreeAuditState.latestAudit.parsedAudit);
+        }
+      } else {
+        document.getElementById("audit-courses-status").textContent =
+          "Could not detect term from an active WebReg tab. Enter term manually.";
+      }
+    });
+  }
+}
 
 async function initializeDegreeAudit() {
   exposeDegreeAuditApi();
@@ -1593,7 +1641,10 @@ function renderDegreeAudit(audit, statusText, isError = false) {
   }
   renderDegreeAuditPreview(audit.parsedAudit);
   setDegreeAuditStatus(statusText, isError);
-  if (audit.parsedAudit) populateCoursesFromAudit(audit.parsedAudit);
+  if (audit.parsedAudit) {
+    populateCoursesFromAudit(audit.parsedAudit);
+    refreshBrowserUseProfileStatus();
+  }
 }
 
 function renderNoAudit(message, isError = false) {
@@ -1607,6 +1658,53 @@ function renderNoAudit(message, isError = false) {
 function setDegreeAuditStatus(message, isError = false) {
   degreeAuditEls.status.textContent = message;
   degreeAuditEls.status.style.color = isError ? "#b42318" : "#667085";
+}
+
+function getCurrentTermCode() {
+  const input = document.getElementById("termcode-input");
+  const value = String(input?.value || DEFAULT_TERM_CODE)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .trim();
+  return value || DEFAULT_TERM_CODE;
+}
+
+function setTermCodeValue(termCode) {
+  const normalized = String(termCode || DEFAULT_TERM_CODE)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .trim();
+  const input = document.getElementById("termcode-input");
+  if (input) input.value = normalized || DEFAULT_TERM_CODE;
+}
+
+async function detectTermCodeFromActiveWebReg() {
+  const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const allTabs = await chrome.tabs.query({ url: ["https://act.ucsd.edu/*"] });
+  const ordered = [...activeTabs, ...allTabs];
+
+  for (const tab of ordered) {
+    const url = String(tab?.url || "");
+    if (!/\/webreg2\//i.test(url)) continue;
+    const term = extractTermCodeFromUrl(url);
+    if (term) return term;
+  }
+  return null;
+}
+
+function extractTermCodeFromUrl(urlString) {
+  try {
+    const url = new URL(urlString);
+    const params = url.searchParams;
+    const term =
+      params.get("termcode") ||
+      params.get("termCode") ||
+      params.get("term");
+    if (!term) return null;
+    return String(term).toUpperCase().replace(/[^A-Z0-9]/g, "");
+  } catch {
+    return null;
+  }
 }
 
 function getAuditId(readUrl) {
@@ -1624,88 +1722,310 @@ function wait(ms) {
 // ── Audit-driven course extraction ─────────────────────────────
 
 /**
- * Walk the parsed degree audit and collect course codes that are still
- * needed — i.e., the `selectCourses.items` from every unfulfilled or
- * in-progress subrequirement.
+ * Collect still-needed subrequirements from the parsed audit.
  */
-function extractRequiredCourses(parsedAudit) {
-  const codes = new Set();
+function extractPendingSubrequirements(parsedAudit) {
+  const pending = [];
   for (const req of parsedAudit?.requirements ?? []) {
     if (req.status === "complete") continue;
     for (const sub of req.subrequirements ?? []) {
       if (sub.status === "complete") continue;
-      for (const code of sub.selectCourses ?? []) {
-        const normalized = code.trim().toUpperCase();
-        if (normalized) codes.add(normalized);
-      }
+      const options = (sub.selectCourses || [])
+        .map(code => normalizeCourseCode(code))
+        .filter(Boolean);
+      if (!options.length) continue;
+      pending.push({
+        requirementTitle: req.title || req.rname || "",
+        subTitle: sub.title || sub.number || "",
+        selectCourses: [...new Set(options)],
+        completedCourses: sub.completedCourses || [],
+        pseudo: sub.pseudo || "",
+        pseudoList: sub.pseudoList || [],
+      });
     }
   }
-  return [...codes];
+  return pending;
 }
 
 /**
- * Given a parsed audit, find which required courses are offered this
- * term (via /api/sections), populate the `courses` array, and
- * re-render the course list.
+ * Build the set of completed courses (audit + manual user entries).
  */
-async function populateCoursesFromAudit(parsedAudit) {
-  const statusEl = document.getElementById("audit-courses-status");
+function buildCompletedCourseSet(parsedAudit) {
+  const done = new Set(
+    completedCourses.map(code => normalizeCourseCode(code)).filter(Boolean)
+  );
 
-  const needed = extractRequiredCourses(parsedAudit);
-  if (!needed.length) {
-    statusEl.textContent = "No unfulfilled course requirements found in your audit.";
-    return;
-  }
-
-  statusEl.textContent = `Checking ${needed.length} required courses against this term's schedule…`;
-
-  let available = [];
-  try {
-    // Batch-lookup: API accepts up to 10 at a time
-    const chunks = [];
-    for (let i = 0; i < needed.length; i += 10) chunks.push(needed.slice(i, i + 10));
-
-    for (const chunk of chunks) {
-      const res = await fetch(`${API_BASE}/api/sections`, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ courses: chunk }),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-      for (const [code, courseData] of Object.entries(data.results ?? {})) {
-        const instructors = [
-          ...new Set(
-            (courseData.sections ?? [])
-              .filter(s => s.type === "LE")
-              .map(s => s.instructor)
-              .filter(n => n && n !== "Staff")
-          ),
-        ];
-        available.push({
-          code,
-          name:        courseData.course_title || code,
-          units:       (courseData.sections?.length ?? 0) + " sec",
-          instructors: instructors.map(n => ({ name: n, rmp: null })),
-        });
+  for (const req of parsedAudit?.requirements ?? []) {
+    for (const sub of req.subrequirements ?? []) {
+      for (const entry of sub.completedCourses ?? []) {
+        const normalized = normalizeCourseCode(entry.course);
+        if (normalized) done.add(normalized);
       }
     }
+  }
+  return done;
+}
+
+function chooseSeriesLockedOptions(subreq, offeredSet) {
+  const options = (subreq.selectCourses || []).filter(code => offeredSet.has(code));
+  if (!options.length) return [];
+
+  const completedPrefixes = new Set();
+  for (const entry of subreq.completedCourses || []) {
+    const normalized = normalizeCourseCode(entry.course);
+    if (!normalized) continue;
+    const prefix = normalized.split(" ")[0];
+    if (prefix) completedPrefixes.add(prefix);
+  }
+
+  if (!completedPrefixes.size) return options;
+  const preferred = options.filter(code => completedPrefixes.has(code.split(" ")[0]));
+  return preferred.length ? preferred : options;
+}
+
+async function fetchWebRegJson(url, init = {}) {
+  const text = await fetchWebRegText(url, init);
+  try {
+    return JSON.parse(text);
   } catch {
-    statusEl.textContent = "Could not reach the schedule API. Is the server running?";
+    throw new Error(`Expected JSON from WebReg but received non-JSON payload for ${url}`);
+  }
+}
+
+async function fetchWebRegText(url, init = {}) {
+  const method = init.method || "GET";
+  pushDegreeAuditDebug(`${method} ${url}`);
+
+  const auditTab = await findAuditCapableTab();
+  if (auditTab?.id != null) {
+    const tabErrors = [];
+    const canScript = hasScriptingApi();
+
+    if (canScript) {
+      try {
+        const mainWorldResult = await fetchAuditTextViaMainWorld(auditTab.id, url, init);
+        return validateWebRegResponse(mainWorldResult, { source: "tab-main" });
+      } catch (error) {
+        tabErrors.push(`main-world: ${error?.message || error}`);
+      }
+    }
+
+    try {
+      const bridgeResult = await fetchAuditTextViaBridge(auditTab.id, url, init);
+      return validateWebRegResponse(bridgeResult, { source: "tab-bridge" });
+    } catch (error) {
+      tabErrors.push(`bridge: ${error?.message || error}`);
+    }
+
+    try {
+      const extensionResult = await fetchAuditTextViaExtension(url, init);
+      return validateWebRegResponse(extensionResult, { source: "popup-fallback" });
+    } catch (error) {
+      tabErrors.push(`popup-fallback: ${error?.message || error}`);
+    }
+
+    throw new Error(`Could not fetch WebReg data from signed-in tab (${tabErrors.join(" | ")}).`);
+  }
+
+  const extensionResult = await fetchAuditTextViaExtension(url, init);
+  return validateWebRegResponse(extensionResult, { source: "popup" });
+}
+
+function validateWebRegResponse(result, context) {
+  if (result.networkError) {
+    throw new Error(`${context.source} network error: ${result.networkError}`);
+  }
+  if (!result.ok) {
+    throw new Error(`WebReg request failed (${result.status || "unknown"})`);
+  }
+  const finalUrl = String(result.url || "");
+  const title = String(result.title || "");
+  if (result.redirected && !/\/webreg2\//i.test(finalUrl)) {
+    throw new Error("Please sign in to UCSD in an act.ucsd.edu tab first.");
+  }
+  if (/login|single sign on|sign in/i.test(title) && !/\/webreg2\//i.test(finalUrl)) {
+    throw new Error("Please sign in to UCSD in an act.ucsd.edu tab first.");
+  }
+  return result.text;
+}
+
+async function fetchAllTermCourses(termCode) {
+  const term = String(termCode || DEFAULT_TERM_CODE).toUpperCase();
+  if (webregCache.termCourseSet.has(term)) return webregCache.termCourseSet.get(term);
+
+  const url = `${WEBREG_BASE_URL}/search-get-crse-list?termcode=${encodeURIComponent(term)}&subjlist=&_=${Date.now()}`;
+  const rows = await fetchWebRegJson(url);
+  const set = new Set(
+    (rows || [])
+      .map(row => normalizeCourseCode(`${String(row?.SUBJ_CODE || "").trim()} ${String(row?.CRSE_CODE || "").trim()}`))
+      .filter(Boolean)
+  );
+  webregCache.termCourseSet.set(term, set);
+  return set;
+}
+
+async function fetchCoursePrerequisites(courseCode, termCode) {
+  const normalized = normalizeCourseCode(courseCode);
+  const term = String(termCode || DEFAULT_TERM_CODE).toUpperCase();
+  const cacheKey = `${term}|${normalized}`;
+  if (webregCache.prerequisites.has(cacheKey)) return webregCache.prerequisites.get(cacheKey);
+
+  const [subj, num] = normalized.split(" ");
+  const url =
+    `${WEBREG_BASE_URL}/get-prerequisites?subjcode=${encodeURIComponent(subj)}` +
+    `&crsecode=${encodeURIComponent(num)}` +
+    `&termcode=${encodeURIComponent(term)}` +
+    `&_=${Date.now()}`;
+  const rows = await fetchWebRegJson(url);
+
+  const prereqs = [...new Set(
+    (rows || [])
+      .filter(row => String(row?.TYPE || "").trim().toUpperCase() === "COURSE")
+      .map(row => normalizeCourseCode(`${String(row?.SUBJECT_CODE || "").trim()} ${String(row?.COURSE_CODE || "").trim()}`))
+      .filter(Boolean)
+  )];
+
+  webregCache.prerequisites.set(cacheKey, prereqs);
+  return prereqs;
+}
+
+async function prerequisitesStatus(courseCode, completedSet, termCode) {
+  const prereqs = await fetchCoursePrerequisites(courseCode, termCode);
+  const missing = prereqs.filter(code => !completedSet.has(code));
+  return { met: missing.length === 0, prereqs, missing };
+}
+
+async function resolveAutoCourses(parsedAudit, termCode) {
+  const pending = extractPendingSubrequirements(parsedAudit);
+  const completedSet = buildCompletedCourseSet(parsedAudit);
+  const offeredSet = await fetchAllTermCourses(termCode);
+
+  const selected = [];
+  const selectedSet = new Set();
+  const deferred = [];
+
+  for (const sub of pending) {
+    if (selected.length >= 4) break;
+    const options = chooseSeriesLockedOptions(sub, offeredSet);
+    if (!options.length) continue;
+
+    let chosen = null;
+    let chosenStatus = null;
+    for (const option of options) {
+      const status = await prerequisitesStatus(option, completedSet, termCode);
+      if (status.met) {
+        chosen = option;
+        chosenStatus = status;
+        break;
+      }
+      if (!chosenStatus) chosenStatus = status;
+    }
+
+    if (chosen && !selectedSet.has(chosen)) {
+      selected.push(chosen);
+      selectedSet.add(chosen);
+      continue;
+    }
+
+    deferred.push({ sub, options, prereqStatus: chosenStatus });
+  }
+
+  for (const item of deferred) {
+    if (selected.length >= 4) break;
+    for (const option of item.options) {
+      const status = await prerequisitesStatus(option, completedSet, termCode);
+      for (const prereq of status.missing) {
+        if (selected.length >= 4) break;
+        if (!offeredSet.has(prereq)) continue;
+        if (completedSet.has(prereq)) continue;
+        if (selectedSet.has(prereq)) continue;
+        selected.push(prereq);
+        selectedSet.add(prereq);
+      }
+      if (selected.length >= 4) break;
+    }
+  }
+
+  if (selected.length < 4) {
+    for (const sub of pending) {
+      if (selected.length >= 4) break;
+      for (const code of chooseSeriesLockedOptions(sub, offeredSet)) {
+        if (selected.length >= 4) break;
+        if (selectedSet.has(code) || completedSet.has(code)) continue;
+        selected.push(code);
+        selectedSet.add(code);
+      }
+    }
+  }
+
+  return selected.slice(0, 4);
+}
+
+function normalizeCourseCode(raw) {
+  if (window.ScheduleEngine?.normalizeCourseCode) {
+    return window.ScheduleEngine.normalizeCourseCode(raw);
+  }
+  return String(raw || "").toUpperCase().replace(/\s+/g, " ").trim();
+}
+
+async function fetchLoadGroupData(courseCode, termCode) {
+  const normalized = normalizeCourseCode(courseCode);
+  const term = String(termCode || DEFAULT_TERM_CODE).toUpperCase();
+  const cacheKey = `${term}|${normalized}`;
+  if (webregCache.loadGroupData.has(cacheKey)) return webregCache.loadGroupData.get(cacheKey);
+
+  const [subj, num] = normalized.split(" ");
+  const url =
+    `${WEBREG_BASE_URL}/search-load-group-data?subjcode=${encodeURIComponent(subj)}` +
+    `&crsecode=${encodeURIComponent(num)}` +
+    `&termcode=${encodeURIComponent(term)}` +
+    `&_=${Date.now()}`;
+  const rows = await fetchWebRegJson(url);
+  const parsed = window.ScheduleEngine.parseLoadGroupDataRows(rows, normalized);
+  webregCache.loadGroupData.set(cacheKey, parsed);
+  return parsed;
+}
+
+async function populateCoursesFromAudit(parsedAudit) {
+  const statusEl = document.getElementById("audit-courses-status");
+  const termCode = getCurrentTermCode();
+
+  const pending = extractPendingSubrequirements(parsedAudit);
+  if (!pending.length) {
+    statusEl.textContent = "No unfulfilled course requirements found in your audit.";
+    courses.length = 0;
+    renderCourseList();
+    syncPassLists();
     return;
   }
 
-  // Clear and repopulate
-  courses.length = 0;
-  for (const c of available) {
-    if (!courses.some(x => x.code === c.code)) courses.push(c);
+  statusEl.textContent = `Resolving required courses and prerequisites for ${termCode}...`;
+
+  let autoCodes = [];
+  try {
+    autoCodes = await resolveAutoCourses(parsedAudit, termCode);
+  } catch (error) {
+    statusEl.textContent = error?.message || "Could not resolve course list from WebReg.";
+    return;
   }
 
-  const notFound = needed.length - available.length;
-  const parts = [`${available.length} required course${available.length !== 1 ? "s" : ""} loaded`];
-  if (notFound > 0) parts.push(`${notFound} not offered this term`);
-  if (available.length === 0) parts.push(`(audit sample: ${needed.slice(0, 5).join(", ")})`);
-  statusEl.textContent = parts.join(" · ");
+  courses.length = 0;
+  for (const code of autoCodes) {
+    courses.push({
+      code,
+      name: code,
+      units: "TBD",
+      instructors: [],
+    });
+  }
+
+  if (autoCodes.length >= 4) {
+    statusEl.textContent = `Auto-selected 4 courses for ${termCode}.`;
+  } else if (autoCodes.length > 0) {
+    statusEl.textContent = `Only ${autoCodes.length} eligible course(s) found for ${termCode}.`;
+  } else {
+    statusEl.textContent = `No eligible courses found for ${termCode}.`;
+  }
 
   renderCourseList();
   syncPassLists();
@@ -2083,9 +2403,13 @@ function getCurrentPrefs() {
   // Hard constraint checkboxes
   const hardLimits = {};
   if (document.getElementById("c-no-8am")?.checked) {
-    hardLimits.neverBefore = 8 * 60;   // any meeting starting at/before 8:00 → score 0
+    hardLimits.neverBefore = 8 * 60;
   }
   if (Object.keys(hardLimits).length) prefs.hardLimits = hardLimits;
+
+  prefs.hardNoFriday = Boolean(document.getElementById("c-no-fri")?.checked);
+  prefs.avoidBackToBack = Boolean(document.getElementById("c-no-back2back")?.checked);
+  prefs.requireNoConflicts = Boolean(document.getElementById("c-no-conflict")?.checked);
 
   return prefs;
 }
@@ -2130,9 +2454,118 @@ function adaptSection(sec, fallbackIdx) {
   };
 }
 
+async function refreshBrowserUseProfileStatus() {
+  const profileStateEl = document.getElementById("browser-use-profile-state");
+  const connectBtn = document.getElementById("browser-use-btn");
+  const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid || null;
+
+  if (!pid) {
+    browserUseProfileState.hasProfile = false;
+    browserUseProfileState.setupStatus = "missing";
+    browserUseProfileState.signedInConfirmed = false;
+    browserUseProfileState.profileId = null;
+    browserUseProfileState.lastError = null;
+    if (profileStateEl) profileStateEl.textContent = "Profile status: fetch degree audit to verify PID.";
+    if (connectBtn) connectBtn.disabled = false;
+    return browserUseProfileState;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/api/browser-use/has-profile?pid=${encodeURIComponent(pid)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+    browserUseProfileState.hasProfile = Boolean(data.hasProfile);
+    browserUseProfileState.setupStatus = data.setupStatus || "missing";
+    browserUseProfileState.signedInConfirmed = Boolean(data.signedInConfirmed);
+    browserUseProfileState.profileId = data.profileId || null;
+    browserUseProfileState.lastError = data.lastError || null;
+
+    if (profileStateEl) {
+      if (data.hasProfile) {
+        profileStateEl.textContent = `Profile status: verified (${data.profileId}).`;
+      } else if (data.setupStatus === "pending") {
+        profileStateEl.textContent = "Profile status: setup pending. Complete login in live session.";
+      } else if (data.setupStatus === "error") {
+        profileStateEl.textContent = `Profile status: setup error${data.lastError ? ` (${data.lastError})` : ""}.`;
+      } else {
+        profileStateEl.textContent = "Profile status: not verified.";
+      }
+    }
+    if (connectBtn) connectBtn.disabled = Boolean(data.hasProfile);
+    return browserUseProfileState;
+  } catch (error) {
+    if (profileStateEl) {
+      profileStateEl.textContent = `Profile status: check failed (${error?.message || error}).`;
+    }
+    if (connectBtn) connectBtn.disabled = false;
+    return browserUseProfileState;
+  }
+}
+
+async function ensureVerifiedProfileForScheduling() {
+  const state = await refreshBrowserUseProfileStatus();
+  if (!state.hasProfile) {
+    throw new Error("Browser Use profile is not verified for this PID yet.");
+  }
+}
+
+async function loadCourseEntriesForTerm(courseCodes, termCode) {
+  const entries = [];
+  for (const code of courseCodes) {
+    const parsed = await fetchLoadGroupData(code, termCode);
+    if (!parsed?.sections?.length) continue;
+    entries.push({ code, sections: parsed.sections });
+  }
+  return entries;
+}
+
+async function getCachedEvalForProfessor(name, courseCode) {
+  const normalizedName = String(name || "").replace(/\s+/g, " ").trim();
+  if (!normalizedName || /^staff$/i.test(normalizedName)) return null;
+
+  const cacheKey = `${normalizedName}|${normalizeCourseCode(courseCode)}`;
+  if (webregCache.evals.has(cacheKey)) return webregCache.evals.get(cacheKey);
+
+  const url =
+    `${API_BASE}/api/evals/professor?name=${encodeURIComponent(normalizedName)}` +
+    `&courseCode=${encodeURIComponent(normalizeCourseCode(courseCode))}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    webregCache.evals.set(cacheKey, null);
+    return null;
+  }
+  const payload = await res.json();
+  const value = payload?.found ? payload : null;
+  webregCache.evals.set(cacheKey, value);
+  return value;
+}
+
+async function enrichEntriesWithCachedEvaluations(entries) {
+  for (const entry of entries) {
+    for (const section of entry.sections || []) {
+      const evals = await getCachedEvalForProfessor(section.instructor, entry.code);
+      if (!evals) continue;
+      if (evals.rmp?.score != null) section.rmp_quality = evals.rmp.score;
+      if (evals.cape?.recommendProf != null) section.cape_recommend_prof = evals.cape.recommendProf;
+      if (evals.cape?.avgHoursPerWeek != null) section.capeHours = evals.cape.avgHoursPerWeek;
+    }
+  }
+}
+
 async function launchResults() {
+  if (!window.ScheduleEngine) {
+    alert("Schedule engine failed to load. Reload the extension popup.");
+    return;
+  }
+
   if (courses.length === 0) {
-    alert("Fetch your degree audit first — no required courses loaded.");
+    alert("Fetch your degree audit first - no required courses loaded.");
+    return;
+  }
+
+  if (courses.length < 4) {
+    alert("Need 4 courses selected before generating schedules.");
     return;
   }
 
@@ -2141,50 +2574,65 @@ async function launchResults() {
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-results"));
   document.getElementById("results-empty").style.display = "none";
   document.getElementById("results-content").style.display = "flex";
-  document.getElementById("sched-label").textContent = "Generating…";
-  document.getElementById("sched-score-badge").textContent = "–";
+  document.getElementById("sched-label").textContent = "Generating...";
+  document.getElementById("sched-score-badge").textContent = "-";
   document.getElementById("score-breakdown").innerHTML = "";
 
   try {
-    const res = await fetch(`${API_BASE}/api/recommend`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        courses:  courses.map(c => c.code),
-        topN:     3,
-        weights:  getCurrentWeights(),
-        prefs:    getCurrentPrefs(),
-      }),
-    });
+    await ensureVerifiedProfileForScheduling();
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || `HTTP ${res.status}`);
+    const termCode = getCurrentTermCode();
+    const selectedCodes = courses.slice(0, 4).map(c => normalizeCourseCode(c.code));
+    const entries = await loadCourseEntriesForTerm(selectedCodes, termCode);
+    if (entries.length < 4) {
+      throw new Error(`Only ${entries.length} of 4 selected courses returned schedule data for ${termCode}.`);
     }
 
-    const data = await res.json();
+    await enrichEntriesWithCachedEvaluations(entries);
 
-    if (!data.schedules?.length) {
-      const missing = data.meta?.missing?.join(", ");
-      const msg = missing
-        ? `No valid schedules — courses not found: ${missing}`
-        : "No valid schedules found (all combinations conflict)";
+    const prefs = getCurrentPrefs();
+    const generated = window.ScheduleEngine.generateSchedules(entries, {
+      allowOverlaps: !prefs.requireNoConflicts,
+      maxCandidates: 2000,
+    });
+
+    let candidateSchedules = generated.schedules || [];
+    if (prefs.hardNoFriday) {
+      candidateSchedules = candidateSchedules.filter(schedule =>
+        !(schedule.sections || []).some(section =>
+          (section.meetings || []).some(meeting =>
+            (window.ScheduleEngine.expandDays(meeting.days || "") || []).includes("F")
+          )
+        )
+      );
+    }
+
+    if (!candidateSchedules.length) {
+      const msg = "No valid schedules found for the selected courses and constraints.";
       document.getElementById("sched-label").textContent = msg;
       document.getElementById("results-content").style.display = "none";
       document.getElementById("results-empty").style.display = "flex";
       return;
     }
 
-    activeSchedules = data.schedules.map(sched => ({
+    const ranked = window.ScheduleEngine.rankSchedules(
+      candidateSchedules,
+      getCurrentWeights(),
+      prefs
+    ).slice(0, 3);
+
+    activeSchedules = ranked.map(sched => ({
       score:     sched.score,
       breakdown: sched.breakdown,
-      summary:   sched.summary ?? "",
+      summary:   window.ScheduleEngine.buildSummary(sched),
       sections:  sched.sections.map((sec, i) => adaptSection(sec, i)),
+      passes:    window.ScheduleEngine.recommendPasses(sched.sections),
     }));
+
     currentScheduleIdx = 0;
     renderSchedule();
   } catch (err) {
-    document.getElementById("sched-label").textContent = "Error — " + err.message;
+    document.getElementById("sched-label").textContent = "Error - " + (err?.message || err);
   }
 }
 
@@ -2477,12 +2925,17 @@ document.getElementById("browser-use-btn").addEventListener("click", async () =>
     return;
   }
 
-  statusEl.textContent = "Connecting…";
+  if (browserUseProfileState.hasProfile) {
+    statusEl.textContent = "Profile is already verified for this PID.";
+    return;
+  }
+
+  statusEl.textContent = "Connecting...";
   linkEl.style.display = "none";
   document.getElementById("browser-use-btn").disabled = true;
 
   try {
-    const res = await fetch(`${API_BASE}/api/setBrowserUse`, {
+    const res = await fetch(`${API_BASE}/api/browser-use/set-profile`, {
       method:  "POST",
       headers: { "Content-Type": "application/json" },
       body:    JSON.stringify({ pid, email, password }),
@@ -2495,17 +2948,73 @@ document.getElementById("browser-use-btn").addEventListener("click", async () =>
       return;
     }
 
-    if (data.sessionUrl) {
-      statusEl.textContent = "Session ready. Open the link to confirm your device for 2FA.";
-      linkEl.href          = data.sessionUrl;
+    if (data.liveUrl) {
+      statusEl.textContent = "Session ready. Open the link to complete login confirmation.";
+      linkEl.href          = data.liveUrl;
       linkEl.style.display = "inline";
     } else {
-      statusEl.textContent = data.message || "Connected.";
+      statusEl.textContent = data.message || "Profile setup started.";
+    }
+
+    for (let i = 0; i < 6; i++) {
+      await wait(3000);
+      const state = await refreshBrowserUseProfileStatus();
+      if (state.hasProfile) {
+        statusEl.textContent = "Profile verified and ready.";
+        break;
+      }
     }
   } catch {
     statusEl.textContent = "Could not reach the server. Is it running?";
   } finally {
-    document.getElementById("browser-use-btn").disabled = false;
-    document.getElementById("bu-password").value = "";
+    if (!browserUseProfileState.hasProfile) {
+      document.getElementById("browser-use-btn").disabled = false;
+  }
+  document.getElementById("bu-password").value = "";
   }
 });
+
+document.getElementById("remove-planned-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("browser-use-status");
+  const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid || null;
+  if (!pid) {
+    statusEl.textContent = "Fetch your degree audit first so we can verify your PID.";
+    return;
+  }
+
+  const state = await refreshBrowserUseProfileStatus();
+  if (!state.hasProfile) {
+    statusEl.textContent = "Profile is not verified yet. Connect Browser Use first.";
+    return;
+  }
+
+  const termCode = getCurrentTermCode();
+  statusEl.textContent = `Removing planned classes for ${termCode}...`;
+  const removeBtn = document.getElementById("remove-planned-btn");
+  removeBtn.disabled = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/browser-use/remove-planned`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pid, termCode, maxRemovals: 4 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+
+    const removed = data.removedCourseCodes || [];
+    if (!removed.length) {
+      statusEl.textContent = "No planned classes were removed (none found in active calendar).";
+    } else {
+      statusEl.textContent = `Removed ${removed.length} planned class(es): ${removed.join(", ")}`;
+    }
+  } catch (error) {
+    statusEl.textContent = `Remove failed: ${error?.message || error}`;
+  } finally {
+    removeBtn.disabled = false;
+  }
+});
+
+void refreshBrowserUseProfileStatus();

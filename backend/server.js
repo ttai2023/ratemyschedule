@@ -1,132 +1,86 @@
-// ============================================================
-// backend/server.js
-//
-// Express API server for the schedule planner.
-// Loads the schedule JSON into memory on startup for O(1) lookups.
-//
-// Run:  node backend/server.js
-// Deps: npm install express cors dotenv
-// ============================================================
-
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import Database from "better-sqlite3";
 import { BrowserUse } from "browser-use-sdk/v3";
-import {
-  loadScheduleIntoMemory,
-  getCourse,
-  getDepartment,
-  searchCourses,
-} from "./scraping/webreg.js";
-import { generateSchedules } from "./scheduler.js";
-import { handleRank } from "./handler.js";
-import { rankSchedules, recommendPasses } from "./scorer.js";
+import { z } from "zod";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// ──────────────────────────────────────────────────────────────
-// Load schedule data into memory on startup
-// ──────────────────────────────────────────────────────────────
+const db = new Database("cache.db");
+db.pragma("journal_mode = WAL");
 
-const DEFAULT_TERM = "S126";
-let ready = false;
+initDb();
 
-async function init() {
-  console.log("[server] Loading schedule data...");
-  await loadScheduleIntoMemory(DEFAULT_TERM);
-  ready = true;
-  console.log("[server] Ready!");
-}
-
-// Health check / readiness
-app.get("/api/health", (req, res) => {
-  res.json({ status: ready ? "ready" : "loading" });
+const LOGIN_RESULT_SCHEMA = z.object({
+  signedInConfirmed: z.boolean().default(false),
+  notes: z.string().optional(),
 });
 
-// ──────────────────────────────────────────────────────────────
-// SCHEDULE ENDPOINTS
-// ──────────────────────────────────────────────────────────────
+const REMOVE_RESULT_SCHEMA = z.object({
+  removedCourseCodes: z.array(z.string()).default([]),
+  removedCount: z.number().int().nonnegative().default(0),
+  notes: z.string().optional(),
+});
 
-/**
- * GET /api/getClass?code=CSE+100&term=S326
- *
- * Returns full course data with all sections, meetings, finals.
- */
-app.get("/api/getClass", (req, res) => {
-  const { code, term = DEFAULT_TERM } = req.query;
-  if (!code) return res.status(400).json({ error: "code param required" });
+const EVAL_REFRESH_SCHEMA = z.object({
+  name: z.string().min(1),
+  courseCode: z.string().trim().min(1).optional(),
+  rmp: z
+    .object({
+      score: z.number().nullable().optional(),
+      difficulty: z.number().nullable().optional(),
+      wouldTakeAgain: z.number().nullable().optional(),
+      tags: z.array(z.string()).optional(),
+    })
+    .optional(),
+  cape: z
+    .object({
+      recommendProf: z.number().nullable().optional(),
+      recommendCourse: z.number().nullable().optional(),
+      avgGradeExpected: z.number().nullable().optional(),
+      avgHoursPerWeek: z.number().nullable().optional(),
+    })
+    .optional(),
+});
 
-  // Extract subject from course code: "CSE 100" → "CSE"
-  const subj = code.split(" ")[0].toUpperCase();
-  const codeNum = code.split(" ")[1];
-  const course = getCourse(term, subj, code.toUpperCase());
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ready" });
+});
 
-  // course doesn't exist
-  if (!course) {
-    return res.status(404).json({ error: `Course ${code} not found` });
+app.get("/api/browser-use/has-profile", (req, res) => {
+  const pid = normalizePid(req.query.pid);
+  if (!pid) {
+    return res.status(400).json({ error: "pid query param required" });
   }
 
-  // need to scrap locally
-  if (!course.sections || course.sections.length === 0) {
-    return res.status(204).json({ error: `Course ${code} has no content` });
-  }
+  const row = getProfileRow(pid);
+  const hasProfile = Boolean(
+    row && row.profile_id && row.signed_in_confirmed === 1 && row.setup_status === "ready"
+  );
 
-  // success
-  res.json(course);
-  return res.status(200).json(course);
+  res.json({
+    pid,
+    hasProfile,
+    profileId: row?.profile_id || null,
+    signedInConfirmed: Boolean(row?.signed_in_confirmed),
+    setupStatus: row?.setup_status || "missing",
+    lastVerifiedAt: row?.last_verified_at || null,
+    lastError: row?.last_error || null,
+  });
 });
 
-/**
- * POST /api/setClass
- *
- * Sets the subject class in the database with same parameters as getClass
- */
-app.post("/api/setClass", (req, res) => {
-  const { code, term = DEFAULT_TERM } = req.body;
-  if (!code) return res.status(400).json({ error: "code param required" });
+app.post("/api/browser-use/set-profile", async (req, res) => {
+  const pid = normalizePid(req.body?.pid);
+  const email = String(req.body?.email || "").trim();
+  const password = String(req.body?.password || "");
 
-  const course = getCourse(term, code.split(" ")[0].toUpperCase(), code.split(" ")[1]);
-  if (!course) {
-    return res.status(404).json({ error: `Course ${code} not found` });
-  }
-
-  res.json(course);
-});
-
-/**
- * GET /api/getProf
- *
- * Get CAPE and Rate My Prof data for a professor by name (e.g. "Smith, John").
- */
-app.get("/api/getProf", (req, res) => {
-  const { name, term = DEFAULT_TERM } = req.query;
-  if (!name) return res.status(400).json({ error: "name param required" });
-
-  const prof = searchCourses(term, name);
-  res.json({professor: prof});
-});
-
-/**
- * POST /api/setBrowserUse
- *
- * Kick off a Browser Use session so the user can log in via SSO.
- * Body: { pid, email, password }
- *
- * Flow:
- *  1. Create a Browser Use session (liveUrl available immediately).
- *  2. Return liveUrl to the user so they can open it and confirm their device for 2FA.
- *  3. Run the SSO login task in the background — agent waits if Duo 2FA fires.
- *  4. On completion, stop the session to persist cookies/fingerprint to the profile.
- */
-app.post("/api/setBrowserUse", async (req, res) => {
-  const { pid, email, password } = req.body;
-
-  if (!pid)      return res.status(400).json({ error: "pid required" });
-  if (!email)    return res.status(400).json({ error: "email required" });
+  if (!pid) return res.status(400).json({ error: "pid required" });
+  if (!email) return res.status(400).json({ error: "email required" });
   if (!password) return res.status(400).json({ error: "password required" });
 
   if (!process.env.BROWSER_USE_API_KEY) {
@@ -135,265 +89,583 @@ app.post("/api/setBrowserUse", async (req, res) => {
 
   const buClient = new BrowserUse();
 
-  // Create session first — liveUrl is available before the task starts
-  const session = await buClient.sessions.create({ keepAlive: true });
-
-  // Return the live session URL to the user immediately so they can
-  // open it, confirm "Yes this is my device", and clear the Duo 2FA prompt
-  res.json({ sessionUrl: session.liveUrl, sessionId: session.id });
-
-  // Run the SSO login in the background after responding
-  (async () => {
-    try {
-      await buClient.run(
-        `Navigate to https://act.ucsd.edu. ` +
-        `Log in via SSO with username "${email}" and password "${password}". ` +
-        `If a Duo two-factor authentication prompt appears, wait patiently — ` +
-        `the user will approve it from their device. ` +
-        `Once fully logged in, confirm the dashboard has loaded.`,
-        {
-          sessionId: session.id,
-          keepAlive: true,
-        }
-      );
-    } catch (err) {
-      console.error(`[browserUse] Login task failed for pid ${pid}:`, err?.message || err);
-    } finally {
-      // Stop the session to save cookies + fingerprint to the profile
-      try { await buClient.sessions.stop(session.id); } catch {}
-    }
-  })();
-});
-
-// ──────────────────────────────────────────────────────────────
-// SCHEDULE GENERATION + RANKING
-// ──────────────────────────────────────────────────────────────
-
-/**
- * POST /api/generate
- *
- * Generate and rank schedule candidates for a set of courses.
- *
- * Body:
- * {
- *   courses:      string[],   // ["CSE 100", "CSE 101", "MATH 183"]
- *   term?:        string,     // default DEFAULT_TERM
- *   weights?:     object,     // { professor, time, finals, days, difficulty }
- *                             //   raw numbers; will be normalised
- *   prefs?:       object,     // { prefStart, prefEnd, hardLimits,
- *                             //   dayPattern, minHours, maxHours }
- *   sectionTypes?: string[],  // default ["LE"]
- * }
- *
- * Returns:
- * {
- *   schedules:     ranked Schedule[],  // each has .score, .breakdown, .sections
- *   count:         number,
- *   totalSections: number[],           // sections available per course
- * }
- */
-app.post("/api/generate", (req, res) => {
-  if (!ready) return res.status(503).json({ error: "Server still loading" });
-
-  const {
-    courses,
-    term    = DEFAULT_TERM,
-    weights = {},
-    prefs   = {},
-  } = req.body;
-
-  if (!courses || !Array.isArray(courses) || courses.length === 0) {
-    return res.status(400).json({ error: "courses array required" });
-  }
-  if (courses.length > 8) {
-    return res.status(400).json({ error: "Max 8 courses per generation request" });
+  let profileId;
+  try {
+    profileId = await resolveOrCreateProfileId(buClient, pid);
+  } catch (error) {
+    return res.status(500).json({
+      error: "Could not create Browser Use profile",
+      details: error?.message || String(error),
+    });
   }
 
-  const { schedules, totalBundles, missing } = generateSchedules(courses, term);
+  const startedAt = nowIso();
+  upsertProfileRow({
+    pid,
+    profileId,
+    signedInConfirmed: false,
+    setupStatus: "pending",
+    lastError: null,
+    lastSetupStartedAt: startedAt,
+  });
 
-  if (schedules.length === 0) {
-    return res.json({ schedules: [], count: 0, totalBundles, missing });
+  let session;
+  try {
+    session = await buClient.sessions.create({
+      profileId,
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+    });
+  } catch (error) {
+    upsertProfileRow({
+      pid,
+      profileId,
+      signedInConfirmed: false,
+      setupStatus: "error",
+      lastError: `session-create: ${error?.message || String(error)}`,
+      lastSetupStartedAt: startedAt,
+      lastSetupCompletedAt: nowIso(),
+    });
+
+    return res.status(500).json({
+      error: "Could not create Browser Use session",
+      details: error?.message || String(error),
+    });
   }
 
-  // Normalise weights
-  const CRITERIA = ["professor", "time", "finals", "days", "difficulty"];
-  const total = CRITERIA.reduce((s, k) => s + (weights[k] ?? 0), 0);
-  const normWeights = total > 0
-    ? Object.fromEntries(CRITERIA.map(k => [k, (weights[k] ?? 0) / total]))
-    : Object.fromEntries(CRITERIA.map(k => [k, 1 / CRITERIA.length]));
+  res.json({
+    pid,
+    profileId,
+    sessionId: session.id,
+    liveUrl: session.liveUrl || null,
+    setupStatus: "pending",
+  });
 
-  const ranked = rankSchedules(schedules, normWeights, prefs);
-
-  res.json({ schedules: ranked, count: ranked.length, totalBundles, missing });
-});
-
-/**
- * POST /api/rank
- *
- * Re-rank already-generated candidates (e.g. when user changes weights).
- * Delegates to handleRank in handler.js.
- */
-app.post("/api/rank", handleRank);
-
-// ──────────────────────────────────────────────────────────────
-// RECOMMEND ENDPOINT
-// ──────────────────────────────────────────────────────────────
-
-/**
- * POST /api/recommend
- *
- * Single-shot: generate, score, and return the top N schedules.
- * Handles linked sections (lecture + discussion combos automatically).
- *
- * Body:
- * {
- *   courses:  string[],  // ["CSE 140", "MATH 183"]
- *   term?:    string,    // default S126
- *   topN?:    number,    // how many to return (default 5, max 20)
- *   weights?: {          // raw numbers, will be normalised to sum 1
- *     professor?:  number,
- *     time?:       number,
- *     finals?:     number,
- *     days?:       number,
- *     difficulty?: number,
- *   },
- *   prefs?: {
- *     prefStart?:  number,  // minutes since midnight (e.g. 540 = 9 AM)
- *     prefEnd?:    number,  // minutes since midnight (e.g. 1020 = 5 PM)
- *     dayPattern?: "MWF" | "TuTh" | "minimize" | "any",
- *     hardLimits?: { neverBefore?: number, neverAfter?: number },
- *     minHours?:   number,
- *     maxHours?:   number,
- *   },
- * }
- *
- * Response:
- * {
- *   schedules: [           // sorted best → worst
- *     {
- *       rank:      number,
- *       score:     number,              // 0–100
- *       breakdown: { professor, time, finals, days, difficulty },
- *       sections: [{
- *         courseCode, section_id, type, instructor,
- *         meetings: [{days, start, end, building, room}],
- *         final, seats_available, status,
- *       }],
- *       summary: string,   // human-readable one-liner, e.g. "MWF 10–11 AM · 3 courses"
- *     }
- *   ],
- *   meta: {
- *     total_valid:    number,   // total non-conflicting combos found
- *     total_bundles:  number[], // bundles available per course
- *     missing:        string[], // course codes not found in schedule data
- *     courses:        string[],
- *   },
- * }
- */
-app.post("/api/recommend", (req, res) => {
-  if (!ready) return res.status(503).json({ error: "Server still loading" });
-
-  const {
-    courses,
-    term    = DEFAULT_TERM,
-    topN    = 5,
-    weights = {},
-    prefs   = {},
-  } = req.body;
-
-  if (!courses || !Array.isArray(courses) || courses.length === 0) {
-    return res.status(400).json({ error: "courses array required" });
-  }
-  if (courses.length > 8) {
-    return res.status(400).json({ error: "Max 8 courses per request" });
-  }
-  const clampedN = Math.min(Math.max(1, topN), 20);
-
-  // ── Generate ──────────────────────────────────────────────────
-  const { schedules, totalBundles, missing } = generateSchedules(
-    courses, term, { topN: clampedN }
-  );
-
-  // ── Normalise weights ─────────────────────────────────────────
-  const CRITERIA = ["professor", "time", "finals", "days", "difficulty"];
-  const wTotal   = CRITERIA.reduce((s, k) => s + (weights[k] ?? 0), 0);
-  const normW    = wTotal > 0
-    ? Object.fromEntries(CRITERIA.map(k => [k, (weights[k] ?? 0) / wTotal]))
-    : Object.fromEntries(CRITERIA.map(k => [k, 1 / CRITERIA.length]));
-
-  // ── Rank all, slice top N ─────────────────────────────────────
-  const ranked = rankSchedules(schedules, normW, prefs).slice(0, clampedN);
-
-  // ── Build summary string for each schedule ────────────────────
-  function buildSummary(sched) {
-    const allMeetings = sched.sections.flatMap(s => s.meetings ?? []);
-    const days = [...new Set(allMeetings.flatMap(m => expandDaysForSummary(m.days ?? "")))];
-    const starts = allMeetings.map(m => toMinsForSummary(m.start)).filter(Boolean);
-    const ends   = allMeetings.map(m => toMinsForSummary(m.end)).filter(Boolean);
-    const earliest = starts.length ? Math.min(...starts) : null;
-    const latest   = ends.length   ? Math.max(...ends)   : null;
-    const dayStr   = formatDays(days);
-    const timeStr  = earliest != null && latest != null
-      ? `${fmtMins(earliest)}–${fmtMins(latest)}`
-      : "";
-    const n = new Set(sched.sections.map(s => s.courseCode)).size;
-    return [dayStr, timeStr, `${n} course${n !== 1 ? "s" : ""}`].filter(Boolean).join(" · ");
-  }
-
-  // Minimal helpers for summary (avoid importing scorer helpers)
-  function toMinsForSummary(t) {
-    if (!t) return null;
-    const [h, m = "0"] = String(t).split(":");
-    return parseInt(h, 10) * 60 + parseInt(m, 10);
-  }
-  function expandDaysForSummary(str) {
-    const out = []; let i = 0;
-    while (i < str.length) {
-      const two = str.slice(i, i + 2);
-      if (two === "Tu" || two === "Th") { out.push(two); i += 2; }
-      else { out.push(str[i]); i += 1; }
-    }
-    return out;
-  }
-  function formatDays(days) {
-    const ORDER = ["M","Tu","W","Th","F"];
-    const sorted = days.sort((a, b) => ORDER.indexOf(a) - ORDER.indexOf(b));
-    return sorted.join("");
-  }
-  function fmtMins(mins) {
-    const h = Math.floor(mins / 60);
-    const m = mins % 60;
-    const p = h >= 12 ? "PM" : "AM";
-    const d = h > 12 ? h - 12 : h === 0 ? 12 : h;
-    return m ? `${d}:${String(m).padStart(2, "0")} ${p}` : `${d} ${p}`;
-  }
-
-  const response = {
-    schedules: ranked.map((sched, i) => ({
-      rank:      i + 1,
-      score:     sched.score,
-      breakdown: sched.breakdown,
-      sections:  sched.sections,
-      summary:   buildSummary(sched),
-      passes:    recommendPasses(sched.sections),
-    })),
-    meta: {
-      total_valid:   schedules.length,
-      total_bundles: totalBundles,
-      missing,
-      courses,
-    },
-  };
-
-  res.json(response);
-});
-
-// ──────────────────────────────────────────────────────────────
-// Start server
-// ──────────────────────────────────────────────────────────────
-
-init().then(() => {
-  app.listen(PORT, () => {
-    console.log(`[server] Listening on http://localhost:${PORT}`);
+  void runProfileSetupInBackground({
+    buClient,
+    pid,
+    profileId,
+    sessionId: session.id,
+    email,
+    password,
+    startedAt,
   });
 });
+
+app.post("/api/browser-use/remove-planned", async (req, res) => {
+  const pid = normalizePid(req.body?.pid);
+  const termCode = String(req.body?.termCode || "").trim().toUpperCase();
+  const maxRemovalsRaw = Number(req.body?.maxRemovals ?? 4);
+  const maxRemovals = Number.isFinite(maxRemovalsRaw)
+    ? Math.max(1, Math.min(8, Math.floor(maxRemovalsRaw)))
+    : 4;
+
+  if (!pid) return res.status(400).json({ error: "pid required" });
+  if (!termCode) return res.status(400).json({ error: "termCode required" });
+
+  const profile = getProfileRow(pid);
+  if (!profile || !profile.profile_id || profile.signed_in_confirmed !== 1 || profile.setup_status !== "ready") {
+    return res.status(409).json({ error: "No verified Browser Use profile found for this PID." });
+  }
+
+  if (!process.env.BROWSER_USE_API_KEY) {
+    return res.status(500).json({ error: "BROWSER_USE_API_KEY not set in environment." });
+  }
+
+  const buClient = new BrowserUse();
+
+  let session;
+  try {
+    session = await buClient.sessions.create({
+      profileId: profile.profile_id,
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+    });
+
+    const prompt = [
+      "Open UCSD WebReg and switch to term code " + termCode + ".",
+      "Go to the active calendar area where planned classes have a Remove button.",
+      "Remove up to " + maxRemovals + " planned classes from the active calendar.",
+      "Only click Remove for classes currently marked planned.",
+      "If no planned classes are present, do not remove anything.",
+      "Return strict JSON with keys: removedCourseCodes (string[]), removedCount (number), notes (string).",
+    ].join(" ");
+
+    const result = await buClient.run(prompt, {
+      sessionId: session.id,
+      keepAlive: false,
+      model: "claude-sonnet-4.6",
+      schema: REMOVE_RESULT_SCHEMA,
+    });
+
+    const removedCourseCodes = dedupeStrings(result.output?.removedCourseCodes || []);
+    const removedCount =
+      Number.isFinite(result.output?.removedCount) && result.output.removedCount >= 0
+        ? Math.min(removedCourseCodes.length || result.output.removedCount, maxRemovals)
+        : Math.min(removedCourseCodes.length, maxRemovals);
+
+    touchProfileVerified(pid);
+
+    return res.json({
+      pid,
+      profileId: profile.profile_id,
+      termCode,
+      removedCourseCodes,
+      removedCount,
+      notes: result.output?.notes || "",
+      sessionId: session.id,
+      liveUrl: session.liveUrl || null,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Failed to remove planned classes",
+      details: error?.message || String(error),
+      liveUrl: session?.liveUrl || null,
+      sessionId: session?.id || null,
+    });
+  } finally {
+    if (session?.id) {
+      try {
+        await buClient.sessions.stop(session.id);
+      } catch {
+        // best effort
+      }
+    }
+  }
+});
+
+app.get("/api/evals/professor", (req, res) => {
+  const name = normalizeProfessorName(req.query.name);
+  const courseCode = normalizeCourseCode(req.query.courseCode);
+
+  if (!name) {
+    return res.status(400).json({ error: "name query param required" });
+  }
+
+  const evals = getProfessorEvaluations(name, courseCode);
+  res.json({
+    found: Boolean(evals.rmp || evals.cape),
+    name,
+    courseCode: courseCode || null,
+    rmp: evals.rmp,
+    cape: evals.cape,
+  });
+});
+
+app.post("/api/evals/professor/refresh", (req, res) => {
+  const parsed = EVAL_REFRESH_SCHEMA.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid refresh payload",
+      details: parsed.error.issues.map(issue => issue.message).join("; "),
+    });
+  }
+
+  const payload = parsed.data;
+  if (!payload.rmp && !payload.cape) {
+    return res.status(400).json({ error: "At least one of rmp or cape must be provided." });
+  }
+
+  const name = normalizeProfessorName(payload.name);
+  const courseCode = normalizeCourseCode(payload.courseCode);
+  const professorId = ensureProfessor(name);
+
+  if (payload.rmp) {
+    insertRmpEvaluation({
+      professorId,
+      courseCode,
+      rmpScore: payload.rmp.score ?? null,
+      rmpDifficulty: payload.rmp.difficulty ?? null,
+      rmpWouldTakeAgain: payload.rmp.wouldTakeAgain ?? null,
+      rmpTags: payload.rmp.tags ?? [],
+    });
+  }
+
+  if (payload.cape) {
+    insertCapeEvaluation({
+      professorId,
+      courseCode,
+      recommendProf: payload.cape.recommendProf ?? null,
+      recommendCourse: payload.cape.recommendCourse ?? null,
+      avgGradeExpected: payload.cape.avgGradeExpected ?? null,
+      avgHoursPerWeek: payload.cape.avgHoursPerWeek ?? null,
+    });
+  }
+
+  const evals = getProfessorEvaluations(name, courseCode);
+  res.json({
+    refreshed: true,
+    name,
+    courseCode: courseCode || null,
+    rmp: evals.rmp,
+    cape: evals.cape,
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`[server] listening on http://localhost:${PORT}`);
+});
+
+async function runProfileSetupInBackground({
+  buClient,
+  pid,
+  profileId,
+  sessionId,
+  email,
+  password,
+  startedAt,
+}) {
+  try {
+    const prompt = [
+      "Navigate to https://act.ucsd.edu/webreg2 and wait for the user to sign in.",
+      "Wait as long as is needed for the user to sign in, and verify their 2fa.",
+      "After login, verify the UCSD landing page is authenticated.",
+      "Return strict JSON with keys signedInConfirmed (boolean) and notes (string).",
+    ].join(" ");
+
+    const result = await buClient.run(prompt, {
+      sessionId,
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+      schema: LOGIN_RESULT_SCHEMA,
+    });
+
+    const signedInConfirmed = Boolean(result.output?.signedInConfirmed || result.isTaskSuccessful);
+    upsertProfileRow({
+      pid,
+      profileId,
+      signedInConfirmed,
+      setupStatus: signedInConfirmed ? "ready" : "error",
+      lastError: signedInConfirmed ? null : result.output?.notes || "Agent could not confirm login state.",
+      lastSetupStartedAt: startedAt,
+      lastSetupCompletedAt: nowIso(),
+      lastVerifiedAt: signedInConfirmed ? nowIso() : null,
+    });
+  } catch (error) {
+    upsertProfileRow({
+      pid,
+      profileId,
+      signedInConfirmed: false,
+      setupStatus: "error",
+      lastError: error?.message || String(error),
+      lastSetupStartedAt: startedAt,
+      lastSetupCompletedAt: nowIso(),
+    });
+  } finally {
+    try {
+      await buClient.sessions.stop(sessionId);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+function initDb() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_use_profiles (
+      pid TEXT PRIMARY KEY,
+      profile_id TEXT NOT NULL,
+      signed_in_confirmed INTEGER NOT NULL DEFAULT 0,
+      setup_status TEXT NOT NULL DEFAULT 'pending',
+      last_error TEXT,
+      last_setup_started_at TEXT,
+      last_setup_completed_at TEXT,
+      last_verified_at TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS professors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS rmp_evaluations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      professor_internal_id INTEGER NOT NULL REFERENCES professors(id),
+      course_code TEXT,
+      rmp_score REAL,
+      rmp_difficulty REAL,
+      rmp_would_take_again REAL,
+      rmp_tags TEXT,
+      last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS cape_evaluations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      professor_internal_id INTEGER NOT NULL REFERENCES professors(id),
+      course_code TEXT,
+      recommend_prof REAL,
+      recommend_course REAL,
+      avg_grade_expected REAL,
+      avg_hours_per_week REAL,
+      last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_professors_name ON professors(name)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_rmp_prof_course ON rmp_evaluations(professor_internal_id, course_code, last_updated)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_cape_prof_course ON cape_evaluations(professor_internal_id, course_code, last_updated)`);
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function normalizePid(value) {
+  const pid = String(value || "").trim();
+  return pid || null;
+}
+
+function normalizeProfessorName(value) {
+  const name = String(value || "").replace(/\s+/g, " ").trim();
+  return name || null;
+}
+
+function normalizeCourseCode(value) {
+  if (value == null) return null;
+  const cleaned = String(value).trim().toUpperCase().replace(/\s+/g, " ");
+  if (!cleaned) return null;
+  const match = cleaned.match(/^([A-Z&]+)\s*([0-9A-Z]+)$/);
+  if (!match) return cleaned;
+  return `${match[1]} ${match[2]}`;
+}
+
+async function resolveOrCreateProfileId(buClient, pid) {
+  const existing = getProfileRow(pid);
+  if (existing?.profile_id) {
+    try {
+      await buClient.profiles.get(existing.profile_id);
+      return existing.profile_id;
+    } catch {
+      // stale profile id, create a new one
+    }
+  }
+
+  const created = await buClient.profiles.create({
+    userId: pid,
+    name: `UCSD PID ${pid}`,
+  });
+
+  if (!created?.id) {
+    throw new Error("Browser Use profile creation returned no id.");
+  }
+
+  return created.id;
+}
+
+function getProfileRow(pid) {
+  return db
+    .prepare(
+      `SELECT pid, profile_id, signed_in_confirmed, setup_status, last_error, last_setup_started_at, last_setup_completed_at, last_verified_at
+       FROM browser_use_profiles
+       WHERE pid = ?`
+    )
+    .get(pid);
+}
+
+function upsertProfileRow({
+  pid,
+  profileId,
+  signedInConfirmed,
+  setupStatus,
+  lastError,
+  lastSetupStartedAt,
+  lastSetupCompletedAt,
+  lastVerifiedAt,
+}) {
+  const previous = getProfileRow(pid);
+
+  const signed = signedInConfirmed ? 1 : 0;
+  const started = lastSetupStartedAt ?? previous?.last_setup_started_at ?? null;
+  const completed = lastSetupCompletedAt ?? previous?.last_setup_completed_at ?? null;
+  const verified = lastVerifiedAt ?? previous?.last_verified_at ?? null;
+
+  db.prepare(
+    `INSERT INTO browser_use_profiles (
+        pid,
+        profile_id,
+        signed_in_confirmed,
+        setup_status,
+        last_error,
+        last_setup_started_at,
+        last_setup_completed_at,
+        last_verified_at,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT(pid) DO UPDATE SET
+        profile_id = excluded.profile_id,
+        signed_in_confirmed = excluded.signed_in_confirmed,
+        setup_status = excluded.setup_status,
+        last_error = excluded.last_error,
+        last_setup_started_at = excluded.last_setup_started_at,
+        last_setup_completed_at = excluded.last_setup_completed_at,
+        last_verified_at = excluded.last_verified_at,
+        updated_at = CURRENT_TIMESTAMP`
+  ).run(
+    pid,
+    profileId,
+    signed,
+    setupStatus,
+    lastError,
+    started,
+    completed,
+    verified
+  );
+}
+
+function touchProfileVerified(pid) {
+  db.prepare(
+    `UPDATE browser_use_profiles
+     SET last_verified_at = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE pid = ?`
+  ).run(nowIso(), pid);
+}
+
+function ensureProfessor(name) {
+  const insert = db.prepare("INSERT OR IGNORE INTO professors(name) VALUES (?)");
+  insert.run(name);
+  return db.prepare("SELECT id FROM professors WHERE name = ?").get(name).id;
+}
+
+function insertRmpEvaluation({
+  professorId,
+  courseCode,
+  rmpScore,
+  rmpDifficulty,
+  rmpWouldTakeAgain,
+  rmpTags,
+}) {
+  db.prepare(
+    `INSERT INTO rmp_evaluations (
+      professor_internal_id,
+      course_code,
+      rmp_score,
+      rmp_difficulty,
+      rmp_would_take_again,
+      rmp_tags,
+      last_updated
+    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+  ).run(
+    professorId,
+    courseCode || null,
+    rmpScore,
+    rmpDifficulty,
+    rmpWouldTakeAgain,
+    JSON.stringify(rmpTags || [])
+  );
+}
+
+function insertCapeEvaluation({
+  professorId,
+  courseCode,
+  recommendProf,
+  recommendCourse,
+  avgGradeExpected,
+  avgHoursPerWeek,
+}) {
+  db.prepare(
+    `INSERT INTO cape_evaluations (
+      professor_internal_id,
+      course_code,
+      recommend_prof,
+      recommend_course,
+      avg_grade_expected,
+      avg_hours_per_week,
+      last_updated
+    ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`
+  ).run(
+    professorId,
+    courseCode || null,
+    recommendProf,
+    recommendCourse,
+    avgGradeExpected,
+    avgHoursPerWeek
+  );
+}
+
+function getProfessorEvaluations(name, courseCode) {
+  const professor = db.prepare("SELECT id FROM professors WHERE name = ?").get(name);
+  if (!professor?.id) {
+    return { rmp: null, cape: null };
+  }
+
+  const params = [professor.id];
+  let courseClause = "";
+  if (courseCode) {
+    courseClause = " AND course_code = ?";
+    params.push(courseCode);
+  }
+
+  const rmp = db
+    .prepare(
+      `SELECT course_code, rmp_score, rmp_difficulty, rmp_would_take_again, rmp_tags, last_updated
+       FROM rmp_evaluations
+       WHERE professor_internal_id = ?${courseClause}
+       ORDER BY last_updated DESC
+       LIMIT 1`
+    )
+    .get(...params);
+
+  const cape = db
+    .prepare(
+      `SELECT course_code, recommend_prof, recommend_course, avg_grade_expected, avg_hours_per_week, last_updated
+       FROM cape_evaluations
+       WHERE professor_internal_id = ?${courseClause}
+       ORDER BY last_updated DESC
+       LIMIT 1`
+    )
+    .get(...params);
+
+  return {
+    rmp: rmp
+      ? {
+          courseCode: rmp.course_code || null,
+          score: rmp.rmp_score,
+          difficulty: rmp.rmp_difficulty,
+          wouldTakeAgain: rmp.rmp_would_take_again,
+          tags: safeParseJsonArray(rmp.rmp_tags),
+          lastUpdated: rmp.last_updated,
+        }
+      : null,
+    cape: cape
+      ? {
+          courseCode: cape.course_code || null,
+          recommendProf: cape.recommend_prof,
+          recommendCourse: cape.recommend_course,
+          avgGradeExpected: cape.avg_grade_expected,
+          avgHoursPerWeek: cape.avg_hours_per_week,
+          lastUpdated: cape.last_updated,
+        }
+      : null,
+  };
+}
+
+function safeParseJsonArray(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function dedupeStrings(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values || []) {
+    const item = String(value || "").trim();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    out.push(item);
+  }
+  return out;
+}

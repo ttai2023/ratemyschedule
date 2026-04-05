@@ -24,57 +24,51 @@ const RMP_ProfessorData = z.object({
 const client = new BrowserUse();
 const UCSD_SID = "U2Nob29sLTEwNzk=";
 
-async function scrapeProfessors(professorNames) {
-  const search_url = `https://www.ratemyprofessors.com/search/professors?q=${professorNames[0]}&sid=${UCSD_SID}`;
-
+async function srapeProfessors(professorObjects) {
   const task = `
-    1. Go to this URL: ${search_url}
-    2. This is a RateMyProfessor search filtered to UC San Diego.
+  We are scraping professors from RateMyProfessors.com for a list of professor names. 
+  Here is your list of comma-separated professor names, and their departments if known: ${professorObjects.map(p => `${p.name} (${p.department ?? "unknown department"})`).join(", ")}.
+  For each professor name, do the following:
+  1. The URLs for every single professor query should be in this format: https://www.ratemyprofessors.com/search/professors?q=[Professor Name]&sid=${UCSD_SID}. This query is modified to only return professors from UCSD. For example, if the professor name is "Gary Gillespie", the URL would be https://www.ratemyprofessors.com/search/professors?q=Gary%20Gillespie&sid=${UCSD_SID}.
+  2. For each professor name in the input list, go to the corresponding URL and look at the search results:
+     - If NO professors are listed, return:
+       { "found": false, "name": "[Professor Name]", "error": "not found" }
+     - If there are results, click on the professor whose name best matches the query.
+       - If there are multiple matches, prefer the one in a relevant department with the most ratings.
+  3. On the professor's profile page, extract:
+     - Their full name as displayed
+      - Their department
+      - Overall quality rating (the big number, 1-5 scale)
+      - Difficulty rating (1-5 scale)
+      - "Would take again" percentage
+      - Number of ratings
+      - The top tags shown (e.g. "Tough grader", "Get ready to read",
+        "Gives good feedback", etc.) — up to 5 tags
+  4. Return the data as a JSON object with these exact keys:
+      name, department, overall_quality, difficulty,
+      would_take_again, num_ratings, tags, found
 
-    3. Look at the search results:
-       - If NO professors are listed, return:
-         { "found": false, "name": "${professorNames[0]}", "error": "not found" }
-       - If there are results, click on the professor whose name
-         best matches "${professorNames[0]}".
-       - If there are multiple matches, prefer the one in a relevant
-         department with the most ratings.
-
-    4. On the professor's profile page, extract:
-       - Their full name as displayed
-       - Their department
-       - Overall quality rating (the big number, 1-5 scale)
-       - Difficulty rating (1-5 scale)
-       - "Would take again" percentage
-       - Number of ratings
-       - The top tags shown (e.g. "Tough grader", "Get ready to read",
-         "Gives good feedback", etc.) — up to 5 tags
-
-    5. Return the data as a JSON object with these exact keys:
-       name, department, overall_quality, difficulty,
-       would_take_again, num_ratings, tags, found
-
-       Example:
-       {
-         "name": "Gary Gillespie",
-         "department": "Computer Science",
-         "overall_quality": 4.2,
-         "difficulty": 3.1,
-         "would_take_again": 85.0,
-         "num_ratings": 142,
-         "tags": ["Caring", "Respected", "Tough grader"],
-         "found": true,
-         "error": null
-       }
+      Example:
+      {
+        "name": "Gary Gillespie",
+        "department": "Computer Science",
+        "overall_quality": 4.2,
+        "difficulty": 3.1,
+        "would_take_again": 85.0,
+        "num_ratings": 142,
+        "tags": ["Caring", "Respected", "Tough grader"],
+        "found": true,
+        "error": null
+      }
   `
-};
 
-const result = await client.run(
-  task,
-  { schema: RMP_ProfessorData },
-);
-for (const professor of result.output.professors) {
-  console.log(`${professor.name} (${professor.overall_quality} pts, ${professor.num_ratings} ratings)`);
-}
+  // init new browser-use session
+  const result = await client.run(
+    task,
+    { schema: RMP_ProfessorData },
+  );
+  return result.output.professors;
+};
 
 
 // --------------------- END OF RATEMYPROFESSOR SCRAPER ---------------------

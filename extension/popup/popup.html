@@ -57,6 +57,7 @@
             <div>
               <div class="section-label">Browser Use</div>
               <p id="browser-use-status" class="degree-audit-status">Connect to auto-enroll via your SSO account.</p>
+              <p id="browser-use-profile-state" class="audit-courses-status">Profile status: not verified.</p>
             </div>
           </div>
           <div class="browser-use-fields">
@@ -65,12 +66,18 @@
           </div>
           <div class="browser-use-actions">
             <button id="browser-use-btn" class="degree-audit-btn">Connect Browser Use</button>
+            <button id="remove-planned-btn" class="degree-audit-btn degree-audit-btn-secondary">Remove Planned (Calendar)</button>
             <a id="browser-use-link" href="#" target="_blank" rel="noreferrer" class="degree-audit-link" style="display:none">Open Live Session</a>
           </div>
         </section>
 
         <!-- Audit-driven course loading -->
         <div id="audit-courses-panel" class="audit-courses-panel">
+          <div class="term-row">
+            <label for="termcode-input">Term</label>
+            <input id="termcode-input" type="text" maxlength="4" value="S126" />
+            <button id="detect-term-btn" class="degree-audit-btn degree-audit-btn-secondary">Detect</button>
+          </div>
           <div class="section-label">
             Required Courses <span id="course-count" class="badge">0</span>
           </div>
@@ -183,7 +190,7 @@
           <div class="checkbox-group">
             <label><input type="checkbox" id="c-no-8am"> No 8 AM classes</label>
             <label><input type="checkbox" id="c-no-fri"> No Friday classes</label>
-            <label><input type="checkbox" id="c-no-conflict"> No time conflicts</label>
+            <label><input type="checkbox" id="c-no-conflict" checked> No time conflicts</label>
             <label><input type="checkbox" id="c-no-back2back"> Avoid back-to-back</label>
           </div>
         </div>
@@ -268,6 +275,7 @@
       </div>
     </div>
 
+    <script src="schedule-engine.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

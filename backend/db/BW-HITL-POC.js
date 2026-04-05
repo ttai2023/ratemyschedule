@@ -12,11 +12,20 @@ import "dotenv" // to load .env file and set process.env.BROWSER_USE_API_KEY
 import * as readline from "readline";
 
 const client = new BrowserUse({
-    apiKey: process.env.BROWSER_USE_API_KEY
+    apiKey: "bu_LrjQmXPG8X-VmeZQGWP6-UZEVUEZV1K6psIQoXyjwDg"
 });
 
+// creates a profile
+const profile = await client.profiles.create({
+    "name": "Ant"
+});
+console.log(`Created profile with id ${profile.id}`);
+
 // create session
-const session = await client.sessions.create();
+const session = await client.sessions.create({
+    keepAlive: true,
+    profileId: profile.id
+});
 console.log(`Live session: ${session.liveUrl}`);
 
 //boiler
@@ -50,5 +59,24 @@ const result2 = await client.run(
 );
 console.log(result2.output);
 
-//cleanu
+//cleanup
 await client.sessions.stop(session.id);
+await client.sessions.delete(session.id);
+
+console.log("Cleaned up. now starting a new session with the same profile to check if login persists...");
+
+// now we try to create a new session, but with the same profile ID to see
+// if the cookies/localstorage persist and we can access the CAPE data without logging in again.
+const session2 = await client.sessions.create({
+    keepAlive: true,
+    profileId: profile.id
+});
+console.log(`Live session: ${session2.liveUrl}`);
+
+// request the same data. the new model and session doesn't have context of the old model, so we redo everything
+
+const result3 = await client.run(
+    `Please access the CAPE website again using the current session, and check if you are still logged in. If you are logged in, please search for "${profName}" in the CAPE website and extract the same data as before for class ${classname}. ***Please return the data in JSON format as the output.*** If you are not logged in, please respond with an error message indicating that the user is not logged in (error 123).`,
+    { sessionId: session2.id }
+);
+console.log(result3.output);

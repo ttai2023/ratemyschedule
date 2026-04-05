@@ -1046,6 +1046,28 @@ header h1 {
   flex-wrap: wrap;
 }
 
+.term-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.term-row label {
+  font-size: 11px;
+  color: #555;
+  font-weight: 600;
+  min-width: 32px;
+}
+
+.term-row input {
+  width: 72px;
+  padding: 6px 8px;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
 .audit-courses-panel {
   display: flex;
   flex-direction: column;

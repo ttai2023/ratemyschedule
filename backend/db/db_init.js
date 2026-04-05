@@ -60,3 +60,16 @@ db.exec(`
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )
 `);
+
+
+// table for the browser-use profiles for each user (stores cookies/localstore)
+// we unforunately store email:pass SSO in plaintext for now.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS browser_use_profiles (
+    pid INTEGER PRIMARY KEY AUTOINCREMENT, --used for referencing users (PID)
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    profile_name TEXT,
+    profile_id TEXT --what's actually used in the requests to BW
+  )
+`);
