@@ -9,7 +9,7 @@ document.querySelectorAll(".tab").forEach(tab => {
 });
 
 // ── Course Selection ───────────────────────────────────────────
-const API_BASE = "http://localhost:3000";
+const API_BASE = "http://localhost:3001";
 
 // courses: array of { code, name, units, instructors: [{name, rmp}] }
 const courses = [];
@@ -35,12 +35,22 @@ async function runSearch() {
   const container = document.getElementById("search-results");
   container.innerHTML = '<p class="search-loading">Searching…</p>';
 
+  // Build query: prefer dept+q combo, fall back to whichever is set
+  const query = [dept, q].filter(Boolean).join(" ");
   try {
-    const params = new URLSearchParams({ dept, q });
-    const res  = await fetch(`${API_BASE}/api/courses/search?${params}`);
+    const params = new URLSearchParams({ q: query });
+    const res  = await fetch(`${API_BASE}/api/search?${params}`);
     if (!res.ok) throw new Error("API error");
     const data = await res.json();
-    renderSearchResults(data);
+    // API returns { results: [{course_code, instructors, section_count}], count }
+    // Map to display shape: {code, name, units, instructors:[{name}]}
+    const mapped = (data.results ?? []).map(r => ({
+      code:        r.course_code,
+      name:        r.course_code,  // WebReg doesn't return a long name — use code for now
+      units:       r.section_count + " sec",
+      instructors: (r.instructors ?? []).map(n => ({ name: n, rmp: null })),
+    }));
+    renderSearchResults(mapped);
   } catch {
     container.innerHTML = '<p class="search-error">Could not reach API. Is the server running?</p>';
   }

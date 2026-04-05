@@ -8,6 +8,7 @@
 // Deps: npm install express cors dotenv
 // ============================================================
 
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import {
@@ -16,6 +17,9 @@ import {
   getDepartment,
   searchCourses,
 } from "./scraping/webreg.js";
+import { generateSchedules } from "./scheduler.js";
+import { handleRank } from "./handler.js";
+import { rankSchedules } from "./scorer.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -27,7 +31,7 @@ app.use(express.json());
 // Load schedule data into memory on startup
 // ──────────────────────────────────────────────────────────────
 
-const DEFAULT_TERM = "S326";
+const DEFAULT_TERM = "S126";
 let ready = false;
 
 async function init() {
@@ -127,6 +131,77 @@ app.post("/api/sections", (req, res) => {
 
   res.json({ results, not_found: notFound });
 });
+
+// ──────────────────────────────────────────────────────────────
+// SCHEDULE GENERATION + RANKING
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/generate
+ *
+ * Generate and rank schedule candidates for a set of courses.
+ *
+ * Body:
+ * {
+ *   courses:      string[],   // ["CSE 100", "CSE 101", "MATH 183"]
+ *   term?:        string,     // default DEFAULT_TERM
+ *   weights?:     object,     // { professor, time, finals, days, difficulty }
+ *                             //   raw numbers; will be normalised
+ *   prefs?:       object,     // { prefStart, prefEnd, hardLimits,
+ *                             //   dayPattern, minHours, maxHours }
+ *   sectionTypes?: string[],  // default ["LE"]
+ * }
+ *
+ * Returns:
+ * {
+ *   schedules:     ranked Schedule[],  // each has .score, .breakdown, .sections
+ *   count:         number,
+ *   totalSections: number[],           // sections available per course
+ * }
+ */
+app.post("/api/generate", (req, res) => {
+  if (!ready) return res.status(503).json({ error: "Server still loading" });
+
+  const {
+    courses,
+    term         = DEFAULT_TERM,
+    weights      = {},
+    prefs        = {},
+    sectionTypes = ["LE"],
+  } = req.body;
+
+  if (!courses || !Array.isArray(courses) || courses.length === 0) {
+    return res.status(400).json({ error: "courses array required" });
+  }
+  if (courses.length > 8) {
+    return res.status(400).json({ error: "Max 8 courses per generation request" });
+  }
+
+  const { schedules, totalSections } = generateSchedules(courses, term, { sectionTypes });
+
+  if (schedules.length === 0) {
+    return res.json({ schedules: [], count: 0, totalSections });
+  }
+
+  // Normalise weights
+  const CRITERIA = ["professor", "time", "finals", "days", "difficulty"];
+  const total = CRITERIA.reduce((s, k) => s + (weights[k] ?? 0), 0);
+  const normWeights = total > 0
+    ? Object.fromEntries(CRITERIA.map(k => [k, (weights[k] ?? 0) / total]))
+    : Object.fromEntries(CRITERIA.map(k => [k, 1 / CRITERIA.length]));
+
+  const ranked = rankSchedules(schedules, normWeights, prefs);
+
+  res.json({ schedules: ranked, count: ranked.length, totalSections });
+});
+
+/**
+ * POST /api/rank
+ *
+ * Re-rank already-generated candidates (e.g. when user changes weights).
+ * Delegates to handleRank in handler.js.
+ */
+app.post("/api/rank", handleRank);
 
 // ──────────────────────────────────────────────────────────────
 // Start server
