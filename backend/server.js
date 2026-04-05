@@ -11,6 +11,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import { BrowserUse } from "browser-use-sdk/v3";
 import {
   loadScheduleIntoMemory,
   getCourse,
@@ -116,9 +117,10 @@ app.get("/api/getProf", (req, res) => {
  * Body: { pid, email, password }
  *
  * Flow:
- *  1. Validate pid (must match degree audit on file).
- *  2. Create a Browser Use project/session (saves cookies + fingerprint for 2FA).
- *  3. Return sessionUrl so the user can open it, confirm their device, and clear 2FA.
+ *  1. Create a Browser Use session (liveUrl available immediately).
+ *  2. Return liveUrl to the user so they can open it and confirm their device for 2FA.
+ *  3. Run the SSO login task in the background — agent waits if Duo 2FA fires.
+ *  4. On completion, stop the session to persist cookies/fingerprint to the profile.
  */
 app.post("/api/setBrowserUse", async (req, res) => {
   const { pid, email, password } = req.body;
@@ -127,11 +129,40 @@ app.post("/api/setBrowserUse", async (req, res) => {
   if (!email)    return res.status(400).json({ error: "email required" });
   if (!password) return res.status(400).json({ error: "password required" });
 
-  // TODO: launch Browser Use session with { pid, email, password }
-  const sessionUrl = await startBrowserUseSession({ pid, email, password });
-  res.json({ sessionUrl });
+  if (!process.env.BROWSER_USE_API_KEY) {
+    return res.status(500).json({ error: "BROWSER_USE_API_KEY not set in environment." });
+  }
 
-  res.status(501).json({ error: "Browser Use session launch not yet implemented." });
+  const buClient = new BrowserUse();
+
+  // Create session first — liveUrl is available before the task starts
+  const session = await buClient.sessions.create({ keepAlive: true });
+
+  // Return the live session URL to the user immediately so they can
+  // open it, confirm "Yes this is my device", and clear the Duo 2FA prompt
+  res.json({ sessionUrl: session.liveUrl, sessionId: session.id });
+
+  // Run the SSO login in the background after responding
+  (async () => {
+    try {
+      await buClient.run(
+        `Navigate to https://act.ucsd.edu. ` +
+        `Log in via SSO with username "${email}" and password "${password}". ` +
+        `If a Duo two-factor authentication prompt appears, wait patiently — ` +
+        `the user will approve it from their device. ` +
+        `Once fully logged in, confirm the dashboard has loaded.`,
+        {
+          sessionId: session.id,
+          keepAlive: true,
+        }
+      );
+    } catch (err) {
+      console.error(`[browserUse] Login task failed for pid ${pid}:`, err?.message || err);
+    } finally {
+      // Stop the session to save cookies + fingerprint to the profile
+      try { await buClient.sessions.stop(session.id); } catch {}
+    }
+  })();
 });
 
 // ──────────────────────────────────────────────────────────────
