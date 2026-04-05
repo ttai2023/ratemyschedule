@@ -1233,3 +1233,313 @@ app.post("/api/recommend", (req, res) => {
     weights,
   });
 });
+
+// ── In-memory job store (fine for hackathon) ──────────────────
+
+const enrollmentJobs = new Map(); // jobId → job object
+
+function generateJobId() {
+  return `enroll-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// ── Schedule enrollment endpoint ──────────────────────────────
+
+app.post("/api/schedule-enroll", async (req, res) => {
+  const pid = normalizePid(req.body?.pid);
+  const termCode = String(req.body?.termCode || "").trim().toUpperCase();
+  const sections = req.body?.sections;
+  const passTimeIso = req.body?.passTime; // ISO string: "2026-05-12T08:00:00-07:00"
+  const warmupMinutes = Math.min(
+    Math.max(Number(req.body?.warmupMinutes ?? 3), 1),
+    10
+  );
+
+  if (!pid) return res.status(400).json({ error: "pid required" });
+  if (!termCode) return res.status(400).json({ error: "termCode required" });
+  if (!Array.isArray(sections) || !sections.length) {
+    return res.status(400).json({ error: "sections array required" });
+  }
+  if (sections.length > 8) {
+    return res.status(400).json({ error: "Max 8 sections per enrollment" });
+  }
+  if (!passTimeIso) {
+    return res.status(400).json({ error: "passTime required (ISO 8601)" });
+  }
+
+  const passTime = new Date(passTimeIso);
+  if (isNaN(passTime.getTime())) {
+    return res.status(400).json({ error: "passTime must be valid ISO 8601" });
+  }
+  if (passTime.getTime() < Date.now() - 60_000) {
+    return res.status(400).json({ error: "passTime is in the past" });
+  }
+
+  const profile = getProfileRow(pid);
+  if (!isVerifiedProfile(profile)) {
+    return res.status(409).json({ error: "No verified Browser Use profile for this PID." });
+  }
+  if (!process.env.BROWSER_USE_API_KEY) {
+    return res.status(500).json({ error: "BROWSER_USE_API_KEY not set." });
+  }
+
+  const jobId = generateJobId();
+  const job = {
+    jobId,
+    pid,
+    profileId: profile.profile_id,
+    termCode,
+    sections,
+    passTime: passTime.toISOString(),
+    warmupMinutes,
+    status: "scheduled",  // scheduled → warming → waiting → enrolling → done / error
+    results: null,
+    error: null,
+    sessionId: null,
+    liveUrl: null,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+
+  enrollmentJobs.set(jobId, job);
+  logInfo("enrollment scheduled", {
+    jobId,
+    pid,
+    termCode,
+    passTime: passTime.toISOString(),
+    warmupMinutes,
+    sectionCount: sections.length,
+  });
+
+  // Respond immediately — enrollment runs in background
+  res.json({
+    jobId,
+    status: "scheduled",
+    passTime: passTime.toISOString(),
+    warmupAt: new Date(passTime.getTime() - warmupMinutes * 60_000).toISOString(),
+    sectionCount: sections.length,
+    message: `Enrollment scheduled. Browser session will warm up ${warmupMinutes} min before your pass time.`,
+  });
+
+  // Fire and forget — runs in background
+  void runScheduledEnrollment(job);
+});
+
+// ── Job status endpoint ───────────────────────────────────────
+
+app.get("/api/browser-use/enroll-status", (req, res) => {
+  const jobId = String(req.query.jobId || "").trim();
+  if (!jobId) return res.status(400).json({ error: "jobId required" });
+
+  const job = enrollmentJobs.get(jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  res.json({
+    jobId: job.jobId,
+    status: job.status,
+    passTime: job.passTime,
+    results: job.results,
+    error: job.error,
+    sessionId: job.sessionId,
+    liveUrl: job.liveUrl,
+    updatedAt: job.updatedAt,
+  });
+});
+
+// ── Cancel endpoint ───────────────────────────────────────────
+
+app.post("/api/browser-use/enroll-cancel", (req, res) => {
+  const jobId = String(req.body?.jobId || "").trim();
+  if (!jobId) return res.status(400).json({ error: "jobId required" });
+
+  const job = enrollmentJobs.get(jobId);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+
+  if (job.status === "done" || job.status === "error") {
+    return res.status(409).json({ error: "Job already finished" });
+  }
+
+  job.status = "cancelled";
+  job.updatedAt = nowIso();
+  logInfo("enrollment cancelled", { jobId });
+  res.json({ jobId, status: "cancelled" });
+});
+
+// ── Background enrollment runner ──────────────────────────────
+
+async function runScheduledEnrollment(job) {
+  const buClient = new BrowserUse();
+  const warmupAt = new Date(job.passTime).getTime() - job.warmupMinutes * 60_000;
+  const passTimeMs = new Date(job.passTime).getTime();
+
+  // Phase 1: Wait until warmup time
+  const waitUntilWarmup = warmupAt - Date.now();
+  if (waitUntilWarmup > 0) {
+    logInfo("enrollment waiting for warmup window", {
+      jobId: job.jobId,
+      waitMs: waitUntilWarmup,
+      warmupAt: new Date(warmupAt).toISOString(),
+    });
+    await sleep(waitUntilWarmup);
+  }
+
+  if (job.status === "cancelled") return;
+
+  // Phase 2: Warm up — create session, navigate to WebReg, confirm login
+  job.status = "warming";
+  job.updatedAt = nowIso();
+
+  let session;
+  try {
+    logInfo("enrollment warmup start", { jobId: job.jobId });
+    session = await buClient.sessions.create({
+      profileId: job.profileId,
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+    });
+    job.sessionId = session.id;
+    job.liveUrl = session.liveUrl || null;
+    job.updatedAt = nowIso();
+
+    logInfo("enrollment warmup session created", {
+      jobId: job.jobId,
+      sessionId: session.id,
+    });
+
+    // Navigate to WebReg and confirm we're logged in
+    const warmupPrompt = [
+      `Navigate to https://act.ucsd.edu/webreg2/start`,
+      `Switch to term ${job.termCode}.`,
+      `Confirm you can see the WebReg enrollment page (not a login screen).`,
+      `Do NOT enroll in anything yet. Just confirm you are on the enrollment page.`,
+      `Return JSON: { "ready": true/false, "notes": "..." }`,
+    ].join(" ");
+
+    const warmupResult = await buClient.run(warmupPrompt, {
+      sessionId: session.id,
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+      schema: z.object({
+        ready: z.boolean().default(false),
+        notes: z.string().optional(),
+      }),
+    });
+
+    if (!warmupResult.output?.ready) {
+      throw new Error(
+        `Warmup failed: WebReg not ready — ${warmupResult.output?.notes || "unknown reason"}`
+      );
+    }
+
+    logInfo("enrollment warmup ready", { jobId: job.jobId });
+  } catch (error) {
+    job.status = "error";
+    job.error = `Warmup failed: ${error?.message || String(error)}`;
+    job.updatedAt = nowIso();
+    logError("enrollment warmup failed", { jobId: job.jobId, error: job.error });
+    if (session?.id) await safelyStopSession(buClient, session.id);
+    return;
+  }
+
+  if (job.status === "cancelled") {
+    if (session?.id) await safelyStopSession(buClient, session.id);
+    return;
+  }
+
+  // Phase 3: Wait for exact pass time
+  const waitUntilPass = passTimeMs - Date.now();
+  if (waitUntilPass > 0) {
+    job.status = "waiting";
+    job.updatedAt = nowIso();
+    logInfo("enrollment waiting for pass time", {
+      jobId: job.jobId,
+      waitMs: waitUntilPass,
+      passTime: job.passTime,
+    });
+    await sleep(waitUntilPass);
+  }
+
+  if (job.status === "cancelled") {
+    if (session?.id) await safelyStopSession(buClient, session.id);
+    return;
+  }
+
+  // Phase 4: Enroll — go go go
+  job.status = "enrolling";
+  job.updatedAt = nowIso();
+
+  try {
+    logInfo("enrollment executing", { jobId: job.jobId, sessionId: session.id });
+
+    const sectionList = job.sections.map((s, i) =>
+      `  ${i + 1}. ${s.courseCode} section ${s.section_id} (section number: ${s.section_number})`
+    ).join("\n");
+
+    const enrollPrompt = [
+      `IMPORTANT: The enrollment window just opened. Act as fast as possible.`,
+      `You are already on UCSD WebReg for term ${job.termCode}.`,
+      ``,
+      `For each section below, search for the course, find the section by its`,
+      `section number, and click Enroll. If full, click Waitlist. If already enrolled, skip.`,
+      `Do this as quickly as possible — speed matters.`,
+      ``,
+      `Sections to enroll:`,
+      sectionList,
+      ``,
+      `Return strict JSON:`,
+      `{`,
+      `  "enrolled": [{ "courseCode": "...", "section_id": "...", "section_number": "...",`,
+      `    "status": "enrolled" | "waitlisted" | "already_enrolled" | "failed" }],`,
+      `  "successCount": number,`,
+      `  "failedCount": number,`,
+      `  "notes": "any issues"`,
+      `}`,
+    ].join("\n");
+
+    const enrollResult = await buClient.run(enrollPrompt, {
+      sessionId: session.id,
+      keepAlive: false,
+      model: "claude-sonnet-4.6",
+      schema: z.object({
+        enrolled: z.array(z.object({
+          courseCode: z.string().default(""),
+          section_id: z.string().default(""),
+          section_number: z.string().default(""),
+          status: z.enum(["enrolled", "waitlisted", "already_enrolled", "failed"]).default("failed"),
+        })).default([]),
+        successCount: z.number().int().nonnegative().default(0),
+        failedCount: z.number().int().nonnegative().default(0),
+        notes: z.string().optional(),
+      }),
+    });
+
+    const output = enrollResult.output || {};
+    job.results = {
+      enrolled: output.enrolled || [],
+      successCount: (output.enrolled || []).filter(
+        e => e.status === "enrolled" || e.status === "waitlisted"
+      ).length,
+      failedCount: (output.enrolled || []).filter(e => e.status === "failed").length,
+      notes: output.notes || "",
+    };
+    job.status = "done";
+    job.updatedAt = nowIso();
+
+    touchProfileVerified(job.pid);
+    logInfo("enrollment done", {
+      jobId: job.jobId,
+      successCount: job.results.successCount,
+      failedCount: job.results.failedCount,
+    });
+  } catch (error) {
+    job.status = "error";
+    job.error = `Enrollment failed: ${error?.message || String(error)}`;
+    job.updatedAt = nowIso();
+    logError("enrollment execution failed", { jobId: job.jobId, error: job.error });
+  } finally {
+    if (session?.id) await safelyStopSession(buClient, session.id);
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}

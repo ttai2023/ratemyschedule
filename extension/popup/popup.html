@@ -247,6 +247,16 @@
         </div>
 
         <button id="assign-pass-btn" class="btn-primary">Auto-Assign</button>
+        <div class="enroll-schedule-row" style="display:flex;flex-direction:column;gap:6px;margin-top:4px">
+          <div style="display:flex;gap:6px;align-items:center">
+            <label style="font-size:11px;font-weight:600;color:#555;white-space:nowrap">Pass Time</label>
+            <input type="datetime-local" id="pass-time-input" style="flex:1;padding:5px 8px;border:1px solid #d0d5dd;border-radius:6px;font-size:11px" />
+          </div>
+          <button id="enroll-btn" class="btn-primary" style="background:#166534">
+            Schedule Auto-Enroll
+          </button>
+          <p id="enroll-status" class="audit-courses-status">Set your pass time and we'll enroll automatically.</p>
+        </div>
       </section>
       <!-- Section detail overlay -->
       <div id="section-detail" class="section-detail" style="display:none">

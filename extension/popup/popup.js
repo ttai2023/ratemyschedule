@@ -3430,3 +3430,153 @@ document.getElementById("remove-planned-btn").addEventListener("click", async ()
     removeBtn.disabled = false;
   }
 });
+
+let activeEnrollJobId = null;
+let enrollPollInterval = null;
+
+document.getElementById("enroll-btn").addEventListener("click", async () => {
+  const sched = activeSchedules[currentScheduleIdx];
+  if (!sched?.sections?.length) {
+    alert("Generate and review schedules first.");
+    return;
+  }
+
+  const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid;
+  if (!pid) { alert("Fetch your degree audit first."); return; }
+
+  const state = await refreshBrowserUseProfileStatus();
+  if (!state.hasProfile) { alert("Connect and verify your Browser Use profile first."); return; }
+
+  const termCode = ensureTermCodeForAction("enrolling");
+  if (!termCode) return;
+
+  const passTimeInput = document.getElementById("pass-time-input");
+  if (!passTimeInput.value) { alert("Set your pass time first."); return; }
+
+  const passTime = new Date(passTimeInput.value);
+  if (isNaN(passTime.getTime())) { alert("Invalid pass time."); return; }
+  if (passTime.getTime() < Date.now() - 60_000) { alert("Pass time is in the past."); return; }
+
+  // Determine which sections to enroll based on pass assignment
+  const passFilter = passAssignments.length
+    ? new Set(passAssignments.filter(p => p.pass === "first").map(p => p.code))
+    : null;
+
+  const sectionsToEnroll = sched.sections
+    .filter(sec => sec.section_number && (!passFilter || passFilter.has(sec.code)))
+    .map(sec => ({
+      courseCode: sec.code,
+      section_id: sec.section_id,
+      section_number: String(sec.section_number),
+    }));
+
+  if (!sectionsToEnroll.length) { alert("No sections with valid section numbers."); return; }
+
+  const passLabel = passFilter ? "first pass" : "all";
+  const timeStr = passTime.toLocaleString();
+  const confirmed = confirm(
+    `Schedule auto-enrollment for ${timeStr}?\n\n` +
+    `${sectionsToEnroll.length} section(s) (${passLabel}):\n` +
+    sectionsToEnroll.map(s => `  ${s.courseCode} ${s.section_id}`).join("\n") +
+    `\n\nThe browser session will warm up 3 min before and enroll the instant your window opens.`
+  );
+  if (!confirmed) return;
+
+  const enrollBtn = document.getElementById("enroll-btn");
+  const statusEl = document.getElementById("enroll-status");
+  enrollBtn.disabled = true;
+  enrollBtn.textContent = "Scheduling...";
+
+  try {
+    const res = await fetch(`${API_BASE}/api/browser-use/schedule-enroll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pid,
+        termCode,
+        sections: sectionsToEnroll,
+        passTime: passTime.toISOString(),
+        warmupMinutes: 3,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+    activeEnrollJobId = data.jobId;
+    enrollBtn.textContent = "Scheduled ✓";
+    statusEl.textContent = `Auto-enroll scheduled for ${timeStr}. Session warms up at ${new Date(data.warmupAt).toLocaleTimeString()}.`;
+
+    // Start polling for status updates
+    startEnrollStatusPolling(data.jobId, statusEl, enrollBtn);
+  } catch (error) {
+    statusEl.textContent = `Scheduling failed: ${error?.message || error}`;
+    enrollBtn.disabled = false;
+    enrollBtn.textContent = "Schedule Auto-Enroll";
+  }
+});
+
+function startEnrollStatusPolling(jobId, statusEl, enrollBtn) {
+  if (enrollPollInterval) clearInterval(enrollPollInterval);
+
+  enrollPollInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/browser-use/enroll-status?jobId=${encodeURIComponent(jobId)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      const statusMessages = {
+        scheduled: "Waiting for warmup window...",
+        warming:   "Warming up browser session, logging into WebReg...",
+        waiting:   "Logged in and ready. Waiting for your pass time...",
+        enrolling: "ENROLLING NOW — fingers crossed!",
+        done:      null,
+        error:     null,
+        cancelled: "Enrollment cancelled.",
+      };
+
+      if (data.liveUrl) {
+        const linkEl = document.getElementById("browser-use-link");
+        linkEl.href = data.liveUrl;
+        linkEl.style.display = "inline";
+      }
+
+      if (data.status === "done") {
+        clearInterval(enrollPollInterval);
+        enrollPollInterval = null;
+
+        const r = data.results || {};
+        statusEl.textContent =
+          `Done! ${r.successCount} enrolled/waitlisted, ${r.failedCount} failed.`;
+
+        if (r.enrolled?.length) {
+          const details = r.enrolled.map(
+            e => `${e.courseCode} ${e.section_id}: ${e.status}`
+          ).join("\n");
+          alert(`Enrollment results:\n\n${details}${r.notes ? `\n\n${r.notes}` : ""}`);
+        }
+
+        enrollBtn.textContent = "Schedule Auto-Enroll";
+        enrollBtn.disabled = false;
+        activeEnrollJobId = null;
+      } else if (data.status === "error") {
+        clearInterval(enrollPollInterval);
+        enrollPollInterval = null;
+        statusEl.textContent = `Error: ${data.error || "Unknown error"}`;
+        enrollBtn.textContent = "Schedule Auto-Enroll";
+        enrollBtn.disabled = false;
+        activeEnrollJobId = null;
+      } else if (data.status === "cancelled") {
+        clearInterval(enrollPollInterval);
+        enrollPollInterval = null;
+        enrollBtn.textContent = "Schedule Auto-Enroll";
+        enrollBtn.disabled = false;
+        activeEnrollJobId = null;
+      } else {
+        statusEl.textContent = statusMessages[data.status] || `Status: ${data.status}`;
+      }
+    } catch {
+      // Polling failure — keep trying
+    }
+  }, 3000);
+}
