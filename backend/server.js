@@ -11,6 +11,61 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+let requestSequence = 0;
+
+function logInfo(message, details = null) {
+  if (details == null) {
+    console.log(`[server] ${message}`);
+    return;
+  }
+  console.log(`[server] ${message}`, details);
+}
+
+function logWarn(message, details = null) {
+  if (details == null) {
+    console.warn(`[server] ${message}`);
+    return;
+  }
+  console.warn(`[server] ${message}`, details);
+}
+
+function logError(message, details = null) {
+  if (details == null) {
+    console.error(`[server] ${message}`);
+    return;
+  }
+  console.error(`[server] ${message}`, details);
+}
+
+function getBodyKeys(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return [];
+  return Object.keys(body).slice(0, 50);
+}
+
+app.use((req, res, next) => {
+  const requestId = `req-${++requestSequence}`;
+  const startedAt = Date.now();
+  logInfo("incoming request", {
+    requestId,
+    method: req.method,
+    path: req.originalUrl,
+    queryKeys: Object.keys(req.query || {}),
+    bodyKeys: getBodyKeys(req.body),
+  });
+
+  res.on("finish", () => {
+    logInfo("request complete", {
+      requestId,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  });
+
+  next();
+});
+
 const db = new Database("cache.db");
 db.pragma("journal_mode = WAL");
 
@@ -48,6 +103,32 @@ const EVAL_REFRESH_SCHEMA = z.object({
     .optional(),
 });
 
+const EVAL_ENSURE_SCHEMA = z.object({
+  pid: z.string().min(1),
+  name: z.string().min(1),
+  courseCode: z.string().trim().min(1).optional(),
+});
+
+const RMP_SCRAPE_SCHEMA = z.object({
+  found: z.boolean().default(false),
+  score: z.number().nullable().optional(),
+  difficulty: z.number().nullable().optional(),
+  wouldTakeAgain: z.number().nullable().optional(),
+  tags: z.array(z.string()).default([]),
+  notes: z.string().optional(),
+});
+
+const CAPE_SCRAPE_SCHEMA = z.object({
+  found: z.boolean().default(false),
+  recommendProf: z.number().nullable().optional(),
+  recommendCourse: z.number().nullable().optional(),
+  avgGradeExpected: z.number().nullable().optional(),
+  avgHoursPerWeek: z.number().nullable().optional(),
+  notes: z.string().optional(),
+});
+
+const RMP_UCSD_SID = "U2Nob29sLTEwNzk=";
+
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ready" });
 });
@@ -72,6 +153,11 @@ app.get("/api/browser-use/has-profile", (req, res) => {
     lastVerifiedAt: row?.last_verified_at || null,
     lastError: row?.last_error || null,
   });
+  logInfo("profile lookup", {
+    pid,
+    hasProfile,
+    setupStatus: row?.setup_status || "missing",
+  });
 });
 
 app.post("/api/browser-use/set-profile", async (req, res) => {
@@ -87,12 +173,16 @@ app.post("/api/browser-use/set-profile", async (req, res) => {
     return res.status(500).json({ error: "BROWSER_USE_API_KEY not set in environment." });
   }
 
+  logInfo("set-profile requested", { pid });
   const buClient = new BrowserUse();
 
   let profileId;
   try {
+    logInfo("browser-use profile resolve/create start", { pid });
     profileId = await resolveOrCreateProfileId(buClient, pid);
+    logInfo("browser-use profile resolve/create done", { pid, profileId });
   } catch (error) {
+    logError("browser-use profile resolve/create failed", { pid, error: error?.message || String(error) });
     return res.status(500).json({
       error: "Could not create Browser Use profile",
       details: error?.message || String(error),
@@ -113,10 +203,17 @@ app.post("/api/browser-use/set-profile", async (req, res) => {
 
   let session;
   try {
+    logInfo("browser-use session create start", { pid, profileId, reason: "set-profile" });
     session = await buClient.sessions.create({
       profileId,
       keepAlive: true,
       model: "claude-sonnet-4.6",
+    });
+    logInfo("browser-use session create done", {
+      pid,
+      profileId,
+      sessionId: session.id,
+      reason: "set-profile",
     });
   } catch (error) {
     upsertProfileRow({
@@ -172,14 +269,22 @@ app.post("/api/browser-use/remove-planned", async (req, res) => {
     return res.status(500).json({ error: "BROWSER_USE_API_KEY not set in environment." });
   }
 
+  logInfo("remove-planned requested", { pid, termCode, maxRemovals });
   const buClient = new BrowserUse();
 
   let session;
   try {
+    logInfo("browser-use session create start", { pid, profileId: profile.profile_id, reason: "remove-planned" });
     session = await buClient.sessions.create({
       profileId: profile.profile_id,
       keepAlive: true,
       model: "claude-sonnet-4.6",
+    });
+    logInfo("browser-use session create done", {
+      pid,
+      profileId: profile.profile_id,
+      sessionId: session.id,
+      reason: "remove-planned",
     });
 
     const prompt = [
@@ -191,12 +296,14 @@ app.post("/api/browser-use/remove-planned", async (req, res) => {
       "Return strict JSON with keys: removedCourseCodes (string[]), removedCount (number), notes (string).",
     ].join(" ");
 
+    logInfo("browser-use run start", { pid, sessionId: session.id, reason: "remove-planned" });
     const result = await buClient.run(prompt, {
       sessionId: session.id,
       keepAlive: false,
       model: "claude-sonnet-4.6",
       schema: REMOVE_RESULT_SCHEMA,
     });
+    logInfo("browser-use run done", { pid, sessionId: session.id, reason: "remove-planned" });
 
     const removedCourseCodes = dedupeStrings(result.output?.removedCourseCodes || []);
     const removedCount =
@@ -217,6 +324,7 @@ app.post("/api/browser-use/remove-planned", async (req, res) => {
       liveUrl: session.liveUrl || null,
     });
   } catch (error) {
+    logError("remove-planned failed", { pid, termCode, error: error?.message || String(error) });
     return res.status(500).json({
       error: "Failed to remove planned classes",
       details: error?.message || String(error),
@@ -226,6 +334,7 @@ app.post("/api/browser-use/remove-planned", async (req, res) => {
   } finally {
     if (session?.id) {
       try {
+        logInfo("browser-use session stop", { sessionId: session.id, reason: "remove-planned" });
         await buClient.sessions.stop(session.id);
       } catch {
         // best effort
@@ -249,6 +358,179 @@ app.get("/api/evals/professor", (req, res) => {
     courseCode: courseCode || null,
     rmp: evals.rmp,
     cape: evals.cape,
+  });
+});
+
+app.post("/api/evals/professor/ensure", async (req, res) => {
+  const parsed = EVAL_ENSURE_SCHEMA.safeParse(req.body || {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Invalid ensure payload",
+      details: parsed.error.issues.map(issue => issue.message).join("; "),
+    });
+  }
+
+  const payload = parsed.data;
+  const pid = normalizePid(payload.pid);
+  const name = normalizeProfessorName(payload.name);
+  const courseCode = normalizeCourseCode(payload.courseCode);
+  if (!pid) return res.status(400).json({ error: "pid is required." });
+  if (!name) return res.status(400).json({ error: "name is required." });
+  logInfo("ensure eval requested", { pid, name, courseCode: courseCode || null });
+
+  const initial = getProfessorEvaluations(name, courseCode);
+  const hadAnyCached = Boolean(initial.rmp || initial.cape);
+  const missing = {
+    rmp: !initial.rmp,
+    cape: !initial.cape,
+  };
+  const refreshed = {
+    rmp: false,
+    cape: false,
+  };
+  const errors = {
+    rmp: null,
+    cape: null,
+  };
+
+  if (missing.rmp || missing.cape) {
+    if (!process.env.BROWSER_USE_API_KEY) {
+      if (missing.rmp) errors.rmp = "BROWSER_USE_API_KEY is not set.";
+      if (missing.cape) errors.cape = "BROWSER_USE_API_KEY is not set.";
+    } else {
+      const buClient = new BrowserUse();
+
+      if (missing.rmp) {
+        try {
+          logInfo("ensure eval scrape start", { pid, name, courseCode: courseCode || null, source: "rmp" });
+          const scrapedRmp = await scrapeRmpEvaluationWithBrowserUse({
+            buClient,
+            professorName: name,
+            courseCode,
+          });
+          if (scrapedRmp?.found) {
+            const professorId = ensureProfessor(name);
+            insertRmpEvaluation({
+              professorId,
+              courseCode,
+              rmpScore: normalizeNullableNumber(scrapedRmp.score),
+              rmpDifficulty: normalizeNullableNumber(scrapedRmp.difficulty),
+              rmpWouldTakeAgain: normalizeNullableNumber(scrapedRmp.wouldTakeAgain),
+              rmpTags: dedupeStrings(scrapedRmp.tags || []),
+            });
+            refreshed.rmp = true;
+            logInfo("ensure eval scrape persisted", {
+              pid,
+              name,
+              courseCode: courseCode || null,
+              source: "rmp",
+            });
+          } else {
+            errors.rmp = scrapedRmp?.notes || "No matching RMP result found.";
+            logWarn("ensure eval scrape miss", {
+              pid,
+              name,
+              courseCode: courseCode || null,
+              source: "rmp",
+              notes: errors.rmp,
+            });
+          }
+        } catch (error) {
+          errors.rmp = error?.message || String(error);
+          logError("ensure eval scrape failed", {
+            pid,
+            name,
+            courseCode: courseCode || null,
+            source: "rmp",
+            error: errors.rmp,
+          });
+        }
+      }
+
+      if (missing.cape) {
+        try {
+          const profile = getProfileRow(pid);
+          if (!isVerifiedProfile(profile)) {
+            throw new Error("No verified Browser Use profile for CAPE scraping.");
+          }
+
+          logInfo("ensure eval scrape start", { pid, name, courseCode: courseCode || null, source: "cape" });
+          const scrapedCape = await scrapeCapeEvaluationWithBrowserUse({
+            buClient,
+            profileId: profile.profile_id,
+            professorName: name,
+            courseCode,
+          });
+
+          if (scrapedCape?.found) {
+            const professorId = ensureProfessor(name);
+            insertCapeEvaluation({
+              professorId,
+              courseCode,
+              recommendProf: normalizeNullableNumber(scrapedCape.recommendProf),
+              recommendCourse: normalizeNullableNumber(scrapedCape.recommendCourse),
+              avgGradeExpected: normalizeNullableNumber(scrapedCape.avgGradeExpected),
+              avgHoursPerWeek: normalizeNullableNumber(scrapedCape.avgHoursPerWeek),
+            });
+            refreshed.cape = true;
+            touchProfileVerified(pid);
+            logInfo("ensure eval scrape persisted", {
+              pid,
+              name,
+              courseCode: courseCode || null,
+              source: "cape",
+            });
+          } else {
+            errors.cape = scrapedCape?.notes || "No matching CAPE result found.";
+            logWarn("ensure eval scrape miss", {
+              pid,
+              name,
+              courseCode: courseCode || null,
+              source: "cape",
+              notes: errors.cape,
+            });
+          }
+        } catch (error) {
+          errors.cape = error?.message || String(error);
+          logError("ensure eval scrape failed", {
+            pid,
+            name,
+            courseCode: courseCode || null,
+            source: "cape",
+            error: errors.cape,
+          });
+        }
+      }
+    }
+  }
+
+  const evals = getProfessorEvaluations(name, courseCode);
+  const source = computeEnsureSource({
+    hadAnyCached,
+    missing,
+    refreshed,
+  });
+
+  res.json({
+    ensured: true,
+    pid,
+    name,
+    courseCode: courseCode || null,
+    found: Boolean(evals.rmp || evals.cape),
+    source,
+    refreshed,
+    errors,
+    rmp: evals.rmp,
+    cape: evals.cape,
+  });
+  logInfo("ensure eval completed", {
+    pid,
+    name,
+    courseCode: courseCode || null,
+    found: Boolean(evals.rmp || evals.cape),
+    source,
+    refreshed,
+    errors,
   });
 });
 
@@ -314,6 +596,7 @@ async function runProfileSetupInBackground({
   startedAt,
 }) {
   try {
+    logInfo("profile setup background run start", { pid, profileId, sessionId });
     const prompt = [
       "Navigate to https://act.ucsd.edu/webreg2 and stop there.",
       "Do not type credentials or attempt Duo/2FA yourself.",
@@ -328,6 +611,7 @@ async function runProfileSetupInBackground({
       model: "claude-sonnet-4.6",
       schema: LOGIN_RESULT_SCHEMA,
     });
+    logInfo("profile setup background run done", { pid, profileId, sessionId });
 
     const signedInConfirmed = Boolean(result.output?.signedInConfirmed || result.isTaskSuccessful);
     upsertProfileRow({
@@ -341,6 +625,12 @@ async function runProfileSetupInBackground({
       lastVerifiedAt: signedInConfirmed ? nowIso() : null,
     });
   } catch (error) {
+    logError("profile setup background run failed", {
+      pid,
+      profileId,
+      sessionId,
+      error: error?.message || String(error),
+    });
     upsertProfileRow({
       pid,
       profileId,
@@ -352,6 +642,7 @@ async function runProfileSetupInBackground({
     });
   } finally {
     try {
+      logInfo("profile setup background session stop", { pid, profileId, sessionId });
       await buClient.sessions.stop(sessionId);
     } catch {
       // best effort
@@ -360,6 +651,7 @@ async function runProfileSetupInBackground({
 }
 
 function initDb() {
+  logInfo("database init start", { file: "cache.db" });
   db.exec(`
     CREATE TABLE IF NOT EXISTS browser_use_profiles (
       pid TEXT PRIMARY KEY,
@@ -413,6 +705,7 @@ function initDb() {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_professors_name ON professors(name)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_rmp_prof_course ON rmp_evaluations(professor_internal_id, course_code, last_updated)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cape_prof_course ON cape_evaluations(professor_internal_id, course_code, last_updated)`);
+  logInfo("database init complete");
 }
 
 function nowIso() {
@@ -442,17 +735,22 @@ async function resolveOrCreateProfileId(buClient, pid) {
   const existing = getProfileRow(pid);
   if (existing?.profile_id) {
     try {
+      logInfo("browser-use profile get start", { pid, profileId: existing.profile_id });
       await buClient.profiles.get(existing.profile_id);
+      logInfo("browser-use profile get done", { pid, profileId: existing.profile_id });
       return existing.profile_id;
     } catch {
       // stale profile id, create a new one
+      logWarn("browser-use profile get failed; creating a new profile", { pid, profileId: existing.profile_id });
     }
   }
 
+  logInfo("browser-use profile create start", { pid });
   const created = await buClient.profiles.create({
     userId: pid,
     name: `UCSD PID ${pid}`,
   });
+  logInfo("browser-use profile create done", { pid, profileId: created?.id || null });
 
   if (!created?.id) {
     throw new Error("Browser Use profile creation returned no id.");
@@ -532,6 +830,12 @@ function upsertProfileRow({
     completed,
     verified
   );
+  logInfo("db write profile upsert", {
+    pid,
+    profileId,
+    setupStatus,
+    signedInConfirmed: Boolean(signedInConfirmed),
+  });
 }
 
 function ensureTableColumn(tableName, columnName, sqliteType) {
@@ -548,12 +852,15 @@ function touchProfileVerified(pid) {
      SET last_verified_at = ?, updated_at = CURRENT_TIMESTAMP
      WHERE pid = ?`
   ).run(nowIso(), pid);
+  logInfo("db write profile verified touch", { pid });
 }
 
 function ensureProfessor(name) {
   const insert = db.prepare("INSERT OR IGNORE INTO professors(name) VALUES (?)");
   insert.run(name);
-  return db.prepare("SELECT id FROM professors WHERE name = ?").get(name).id;
+  const row = db.prepare("SELECT id FROM professors WHERE name = ?").get(name);
+  logInfo("db write professor ensure", { name, professorId: row?.id || null });
+  return row.id;
 }
 
 function insertRmpEvaluation({
@@ -582,6 +889,10 @@ function insertRmpEvaluation({
     rmpWouldTakeAgain,
     JSON.stringify(rmpTags || [])
   );
+  logInfo("db write rmp evaluation", {
+    professorId,
+    courseCode: courseCode || null,
+  });
 }
 
 function insertCapeEvaluation({
@@ -610,6 +921,10 @@ function insertCapeEvaluation({
     avgGradeExpected,
     avgHoursPerWeek
   );
+  logInfo("db write cape evaluation", {
+    professorId,
+    courseCode: courseCode || null,
+  });
 }
 
 function getProfessorEvaluations(name, courseCode) {
@@ -667,6 +982,164 @@ function getProfessorEvaluations(name, courseCode) {
         }
       : null,
   };
+}
+
+function isVerifiedProfile(profile) {
+  return Boolean(
+    profile &&
+    profile.profile_id &&
+    profile.signed_in_confirmed === 1 &&
+    profile.setup_status === "ready"
+  );
+}
+
+function normalizeNullableNumber(value) {
+  if (value == null) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function computeEnsureSource({ hadAnyCached, missing, refreshed }) {
+  if (!missing.rmp && !missing.cape) return "cache";
+  if ((refreshed.rmp || refreshed.cape) && hadAnyCached) return "cache+scraped";
+  if (refreshed.rmp || refreshed.cape) return "scraped";
+  if (hadAnyCached) return "cache-partial";
+  return "miss";
+}
+
+async function scrapeRmpEvaluationWithBrowserUse({
+  buClient,
+  professorName,
+  courseCode,
+}) {
+  let session;
+  try {
+    logInfo("browser-use session create start", { reason: "rmp-scrape", professorName, courseCode: courseCode || null });
+    session = await buClient.sessions.create({
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+    });
+    logInfo("browser-use session create done", {
+      reason: "rmp-scrape",
+      sessionId: session.id,
+      professorName,
+      courseCode: courseCode || null,
+    });
+
+    const searchUrl = `https://www.ratemyprofessors.com/search/professors?q=${encodeURIComponent(professorName)}&sid=${RMP_UCSD_SID}`;
+    const courseHint = courseCode ? `Course context: ${courseCode}.` : "";
+    const prompt = [
+      `Use RateMyProfessors to find "${professorName}" at UCSD.`,
+      `Start from this search URL: ${searchUrl}.`,
+      "If multiple matches exist, choose the UCSD result with the best exact name match and most ratings.",
+      courseHint,
+      "Extract overall score (1-5), difficulty (1-5), would-take-again percent, and up to 5 tags.",
+      "Return strict JSON with keys: found, score, difficulty, wouldTakeAgain, tags, notes.",
+      "If no reliable match exists, set found=false and explain in notes.",
+    ].join(" ");
+
+    logInfo("browser-use run start", {
+      reason: "rmp-scrape",
+      sessionId: session.id,
+      professorName,
+      courseCode: courseCode || null,
+    });
+    const result = await buClient.run(prompt, {
+      sessionId: session.id,
+      keepAlive: false,
+      model: "claude-sonnet-4.6",
+      schema: RMP_SCRAPE_SCHEMA,
+    });
+    logInfo("browser-use run done", {
+      reason: "rmp-scrape",
+      sessionId: session.id,
+      professorName,
+      courseCode: courseCode || null,
+      found: Boolean(result.output?.found),
+    });
+
+    return result.output;
+  } finally {
+    if (session?.id) {
+      await safelyStopSession(buClient, session.id);
+    }
+  }
+}
+
+async function scrapeCapeEvaluationWithBrowserUse({
+  buClient,
+  profileId,
+  professorName,
+  courseCode,
+}) {
+  let session;
+  try {
+    logInfo("browser-use session create start", {
+      reason: "cape-scrape",
+      profileId,
+      professorName,
+      courseCode: courseCode || null,
+    });
+    session = await buClient.sessions.create({
+      profileId,
+      keepAlive: true,
+      model: "claude-sonnet-4.6",
+    });
+    logInfo("browser-use session create done", {
+      reason: "cape-scrape",
+      sessionId: session.id,
+      profileId,
+      professorName,
+      courseCode: courseCode || null,
+    });
+
+    const courseHint = courseCode ? `Prefer rows relevant to ${courseCode} when available.` : "";
+    const prompt = [
+      "Open https://cape.ucsd.edu/responses/Results.aspx using the existing authenticated session.",
+      `Search for instructor "${professorName}".`,
+      courseHint,
+      "Extract Recommend Instructor (%), Recommend Class (%), Avg Grade Expected, and Study Hrs/Wk.",
+      "Return strict JSON with keys: found, recommendProf, recommendCourse, avgGradeExpected, avgHoursPerWeek, notes.",
+      "If login is required, access is blocked, or no reliable match exists, set found=false and explain in notes.",
+    ].join(" ");
+
+    logInfo("browser-use run start", {
+      reason: "cape-scrape",
+      sessionId: session.id,
+      profileId,
+      professorName,
+      courseCode: courseCode || null,
+    });
+    const result = await buClient.run(prompt, {
+      sessionId: session.id,
+      keepAlive: false,
+      model: "claude-sonnet-4.6",
+      schema: CAPE_SCRAPE_SCHEMA,
+    });
+    logInfo("browser-use run done", {
+      reason: "cape-scrape",
+      sessionId: session.id,
+      profileId,
+      professorName,
+      courseCode: courseCode || null,
+      found: Boolean(result.output?.found),
+    });
+
+    return result.output;
+  } finally {
+    if (session?.id) {
+      await safelyStopSession(buClient, session.id);
+    }
+  }
+}
+
+async function safelyStopSession(buClient, sessionId) {
+  try {
+    logInfo("browser-use session stop", { sessionId });
+    await buClient.sessions.stop(sessionId);
+  } catch {
+    // Best effort.
+  }
 }
 
 function safeParseJsonArray(raw) {

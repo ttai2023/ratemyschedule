@@ -10,15 +10,17 @@ document.querySelectorAll(".tab").forEach(tab => {
 
 // ── Course Selection ───────────────────────────────────────────
 const API_BASE = "http://localhost:3001";
-const DEFAULT_TERM_CODE = "S126";
 const WEBREG_BASE_URL = "https://act.ucsd.edu/webreg2/svc/wradapter/secure";
+const TERM_CODE_REGEX = /^[A-Z][0-9]{3}$/;
+const PREFS_STORAGE_KEY = "popup.preferences.v1";
+const PREFS_LOCAL_STORAGE_KEY = "popup.preferences.v1.local";
 
 // courses: array of { code, name, units, instructors: [{name, rmp}] }
 const courses = [];
 const webregCache = {
+  termCourseCatalog: new Map(),
   termCourseSet: new Map(),
   prerequisites: new Map(),
-  loadGroupData: new Map(),
   evals: new Map(),
 };
 const browserUseProfileState = {
@@ -74,22 +76,39 @@ const degreeAuditState = {
 
 degreeAuditEls.fetchBtn.addEventListener("click", fetchMostRecentAuditManually);
 degreeAuditEls.requestBtn.addEventListener("click", requestNewAudit);
-initializeDegreeAudit();
-initializeWebRegControls();
 
-function initializeWebRegControls() {
+void bootstrapPopup();
+
+async function bootstrapPopup() {
+  await restorePreferencesState();
+  bindPreferencePersistence();
+  await initializeWebRegControls();
+  await initializeDegreeAudit();
+  await refreshBrowserUseProfileStatus();
+}
+
+async function initializeWebRegControls() {
   const termInput = document.getElementById("termcode-input");
-  if (termInput && !termInput.value) {
-    termInput.value = DEFAULT_TERM_CODE;
+  if (termInput) {
+    termInput.value = normalizeTermCode(termInput.value);
+    termInput.addEventListener("input", () => {
+      termInput.value = normalizeTermCode(termInput.value);
+    });
+    termInput.addEventListener("change", async () => {
+      termInput.value = normalizeTermCode(termInput.value);
+      if (degreeAuditState.latestAudit?.parsedAudit) {
+        await populateCoursesFromAudit(degreeAuditState.latestAudit.parsedAudit);
+      }
+    });
   }
 
-  void (async () => {
-    const detected = await detectTermCodeFromActiveWebReg();
-    if (detected) {
-      setTermCodeValue(detected);
-      pushDegreeAuditDebug(`Detected term code ${detected} from WebReg tab.`);
-    }
-  })();
+  const detected = await detectTermCodeFromActiveWebReg();
+  if (detected) {
+    setTermCodeValue(detected);
+    pushDegreeAuditDebug(`Detected term code ${detected} from WebReg tab.`);
+  } else {
+    pushDegreeAuditDebug("No term code detected on startup. Waiting for manual term entry or Detect.");
+  }
 
   const detectBtn = document.getElementById("detect-term-btn");
   if (detectBtn) {
@@ -1332,6 +1351,127 @@ async function clearCachedAudit() {
   }
 }
 
+async function readStoredPopupValue(storageKey, fallbackKey) {
+  if (hasChromeStorageLocal()) {
+    try {
+      const payload = await chrome.storage.local.get(storageKey);
+      if (payload && Object.prototype.hasOwnProperty.call(payload, storageKey)) {
+        return payload[storageKey];
+      }
+    } catch {
+      // Ignore and try localStorage fallback.
+    }
+  }
+
+  try {
+    const raw = window.localStorage.getItem(fallbackKey);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeStoredPopupValue(storageKey, fallbackKey, value) {
+  if (hasChromeStorageLocal()) {
+    try {
+      await chrome.storage.local.set({ [storageKey]: value });
+      return;
+    } catch {
+      // Ignore and try localStorage fallback.
+    }
+  }
+
+  try {
+    window.localStorage.setItem(fallbackKey, JSON.stringify(value));
+  } catch {
+    // Best effort.
+  }
+}
+
+function collectPreferencesStateFromUi() {
+  const dayButtons = [...document.querySelectorAll(".day-btn")];
+  return {
+    prefStart: document.getElementById("pref-start")?.value || null,
+    prefEnd: document.getElementById("pref-end")?.value || null,
+    activeDays: dayButtons
+      .filter(btn => btn.classList.contains("active"))
+      .map(btn => btn.dataset.day)
+      .filter(Boolean),
+    no8am: Boolean(document.getElementById("c-no-8am")?.checked),
+    noFriday: Boolean(document.getElementById("c-no-fri")?.checked),
+    noConflict: Boolean(document.getElementById("c-no-conflict")?.checked),
+    noBackToBack: Boolean(document.getElementById("c-no-back2back")?.checked),
+  };
+}
+
+function applyPreferencesStateToUi(state) {
+  if (!state || typeof state !== "object") return;
+
+  const prefStart = document.getElementById("pref-start");
+  if (prefStart && typeof state.prefStart === "string") {
+    if ([...prefStart.options].some(option => option.value === state.prefStart)) {
+      prefStart.value = state.prefStart;
+    }
+  }
+
+  const prefEnd = document.getElementById("pref-end");
+  if (prefEnd && typeof state.prefEnd === "string") {
+    if ([...prefEnd.options].some(option => option.value === state.prefEnd)) {
+      prefEnd.value = state.prefEnd;
+    }
+  }
+
+  if (Array.isArray(state.activeDays) && state.activeDays.length) {
+    const activeDays = new Set(state.activeDays.map(day => String(day)));
+    document.querySelectorAll(".day-btn").forEach(btn => {
+      btn.classList.toggle("active", activeDays.has(btn.dataset.day));
+    });
+  }
+
+  if (typeof state.no8am === "boolean" && document.getElementById("c-no-8am")) {
+    document.getElementById("c-no-8am").checked = state.no8am;
+  }
+  if (typeof state.noFriday === "boolean" && document.getElementById("c-no-fri")) {
+    document.getElementById("c-no-fri").checked = state.noFriday;
+  }
+  if (typeof state.noConflict === "boolean" && document.getElementById("c-no-conflict")) {
+    document.getElementById("c-no-conflict").checked = state.noConflict;
+  }
+  if (typeof state.noBackToBack === "boolean" && document.getElementById("c-no-back2back")) {
+    document.getElementById("c-no-back2back").checked = state.noBackToBack;
+  }
+}
+
+async function restorePreferencesState() {
+  const stored = await readStoredPopupValue(PREFS_STORAGE_KEY, PREFS_LOCAL_STORAGE_KEY);
+  applyPreferencesStateToUi(stored);
+}
+
+async function persistPreferencesState() {
+  const payload = collectPreferencesStateFromUi();
+  await writeStoredPopupValue(PREFS_STORAGE_KEY, PREFS_LOCAL_STORAGE_KEY, payload);
+}
+
+function bindPreferencePersistence() {
+  const trackedSelectors = [
+    "#pref-start",
+    "#pref-end",
+    "#c-no-8am",
+    "#c-no-fri",
+    "#c-no-conflict",
+    "#c-no-back2back",
+    ".day-btn",
+  ];
+  trackedSelectors.forEach(selector => {
+    document.querySelectorAll(selector).forEach(el => {
+      const eventName = selector === ".day-btn" ? "click" : "change";
+      el.addEventListener(eventName, () => {
+        void persistPreferencesState();
+      });
+    });
+  });
+}
+
 function buildCachedAuditPayload(audit) {
   return {
     version: DEGREE_AUDIT_CACHE_VERSION,
@@ -1661,32 +1801,49 @@ function setDegreeAuditStatus(message, isError = false) {
 
 function getCurrentTermCode() {
   const input = document.getElementById("termcode-input");
-  const value = String(input?.value || DEFAULT_TERM_CODE)
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "")
-    .trim();
-  return value || DEFAULT_TERM_CODE;
+  return normalizeTermCode(input?.value || "");
 }
 
 function setTermCodeValue(termCode) {
-  const normalized = String(termCode || DEFAULT_TERM_CODE)
+  const normalized = normalizeTermCode(termCode || "");
+  const input = document.getElementById("termcode-input");
+  if (input) input.value = normalized;
+}
+
+function normalizeTermCode(rawTermCode) {
+  const normalized = String(rawTermCode || "")
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
     .trim();
-  const input = document.getElementById("termcode-input");
-  if (input) input.value = normalized || DEFAULT_TERM_CODE;
+  return TERM_CODE_REGEX.test(normalized) ? normalized : "";
+}
+
+function ensureTermCodeForAction(actionLabel, statusEl = null) {
+  const termCode = getCurrentTermCode();
+  if (termCode) return termCode;
+  if (statusEl) {
+    statusEl.textContent = `Detect your WebReg term or enter it manually before ${actionLabel}.`;
+  }
+  return null;
 }
 
 async function detectTermCodeFromActiveWebReg() {
   const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const allTabs = await chrome.tabs.query({ url: ["https://act.ucsd.edu/*"] });
   const ordered = [...activeTabs, ...allTabs];
+  const seenTabIds = new Set();
 
   for (const tab of ordered) {
+    if (!tab?.id || seenTabIds.has(tab.id)) continue;
+    seenTabIds.add(tab.id);
+
     const url = String(tab?.url || "");
-    if (!/\/webreg2\//i.test(url)) continue;
     const term = extractTermCodeFromUrl(url);
     if (term) return term;
+
+    if (!/^https:\/\/act\.ucsd\.edu\//i.test(url)) continue;
+    const fromPage = await detectTermCodeFromTabContext(tab.id);
+    if (fromPage) return fromPage;
   }
   return null;
 }
@@ -1700,8 +1857,26 @@ function extractTermCodeFromUrl(urlString) {
       params.get("termcode") ||
       params.get("termCode") ||
       params.get("term");
-    if (!term) return null;
-    return String(term).toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return normalizeTermCode(term || "");
+  } catch {
+    return null;
+  }
+}
+
+async function detectTermCodeFromTabContext(tabId) {
+  try {
+    const result = await sendMessageToTab(tabId, { type: "webregDetectTerm" });
+    if (!result) return null;
+    const candidates = Array.isArray(result.candidates) ? result.candidates : [];
+    if (result.termCode) {
+      const normalized = normalizeTermCode(result.termCode);
+      if (normalized) return normalized;
+    }
+    for (const candidate of candidates) {
+      const normalized = normalizeTermCode(candidate);
+      if (normalized) return normalized;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -1848,23 +2023,131 @@ function validateWebRegResponse(result, context) {
 }
 
 async function fetchAllTermCourses(termCode) {
-  const term = String(termCode || DEFAULT_TERM_CODE).toUpperCase();
+  const term = normalizeTermCode(termCode);
+  if (!term) {
+    throw new Error("A valid term code is required before loading WebReg course data.");
+  }
   if (webregCache.termCourseSet.has(term)) return webregCache.termCourseSet.get(term);
 
-  const url = `${WEBREG_BASE_URL}/search-get-crse-list?termcode=${encodeURIComponent(term)}&subjlist=&_=${Date.now()}`;
-  const rows = await fetchWebRegJson(url);
-  const set = new Set(
-    (rows || [])
-      .map(row => normalizeCourseCode(`${String(row?.SUBJ_CODE || "").trim()} ${String(row?.CRSE_CODE || "").trim()}`))
-      .filter(Boolean)
-  );
+  const catalog = await fetchTermCourseCatalog(term);
+  const set = new Set(catalog.keys());
   webregCache.termCourseSet.set(term, set);
   return set;
 }
 
+async function fetchTermCourseCatalog(termCode) {
+  const term = normalizeTermCode(termCode);
+  if (!term) {
+    throw new Error("A valid term code is required before loading WebReg course data.");
+  }
+  if (webregCache.termCourseCatalog.has(term)) return webregCache.termCourseCatalog.get(term);
+
+  const url = `${WEBREG_BASE_URL}/search-get-crse-list?termcode=${encodeURIComponent(term)}&subjlist=&_=${Date.now()}`;
+  const rows = await fetchWebRegJson(url);
+  const catalog = new Map();
+
+  for (const row of rows || []) {
+    const code = extractCatalogCourseCode(row);
+    if (!code) continue;
+
+    const current = catalog.get(code) || { units: null, title: "" };
+    const units = extractCatalogUnits(row);
+    const title = extractCatalogTitle(row);
+
+    if (units != null && current.units == null) current.units = units;
+    if (title && !current.title) current.title = title;
+
+    catalog.set(code, current);
+  }
+
+  webregCache.termCourseCatalog.set(term, catalog);
+  webregCache.termCourseSet.set(term, new Set(catalog.keys()));
+  return catalog;
+}
+
+function extractCatalogCourseCode(row) {
+  const subj = String(row?.SUBJ_CODE || row?.SUBJECT_CODE || "").trim();
+  const num = String(row?.CRSE_CODE || row?.COURSE_CODE || "").trim();
+  return normalizeCourseCode(`${subj} ${num}`);
+}
+
+function extractCatalogTitle(row) {
+  return String(
+    row?.CRSE_TITLE ||
+    row?.COURSE_TITLE ||
+    row?.LONG_DESC ||
+    row?.COURSE_DESC ||
+    ""
+  ).replace(/\s+/g, " ").trim();
+}
+
+function extractCatalogUnits(row) {
+  const unitFrom = asFiniteNumber(row?.UNIT_FROM ?? row?.UNIT_MIN ?? row?.LOW_UNITS);
+  const unitTo = asFiniteNumber(row?.UNIT_TO ?? row?.UNIT_MAX ?? row?.HIGH_UNITS);
+  if (unitFrom != null && unitTo != null) {
+    if (unitFrom === unitTo) return unitFrom;
+    return `${formatUnitValue(unitFrom)}-${formatUnitValue(unitTo)}`;
+  }
+
+  const prioritizedKeys = [
+    "UNITS",
+    "CRSE_UNITS",
+    "COURSE_UNITS",
+    "UNIT",
+    "CREDIT_HRS",
+    "UNIT_VALUE",
+  ];
+  for (const key of prioritizedKeys) {
+    if (!(key in (row || {}))) continue;
+    const parsed = parseUnitValue(row[key]);
+    if (parsed != null) return parsed;
+  }
+
+  for (const [key, value] of Object.entries(row || {})) {
+    if (!/unit|credit/i.test(key)) continue;
+    const parsed = parseUnitValue(value);
+    if (parsed != null) return parsed;
+  }
+
+  return null;
+}
+
+function parseUnitValue(raw) {
+  if (raw == null) return null;
+  const text = String(raw).trim();
+  if (!text) return null;
+  const numeric = Number(text);
+  if (Number.isFinite(numeric)) return numeric;
+  const rangeMatch = text.match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)$/);
+  if (rangeMatch) {
+    return `${formatUnitValue(Number(rangeMatch[1]))}-${formatUnitValue(Number(rangeMatch[2]))}`;
+  }
+  return null;
+}
+
+function asFiniteNumber(raw) {
+  const numeric = Number(raw);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function formatUnitValue(value) {
+  return Number.isInteger(value) ? String(value) : String(value);
+}
+
+function formatUnitsForDisplay(units) {
+  if (units == null) return "TBD";
+  if (typeof units === "number") {
+    return Number.isInteger(units) ? String(units) : String(units);
+  }
+  return String(units);
+}
+
 async function fetchCoursePrerequisites(courseCode, termCode) {
   const normalized = normalizeCourseCode(courseCode);
-  const term = String(termCode || DEFAULT_TERM_CODE).toUpperCase();
+  const term = normalizeTermCode(termCode);
+  if (!term) {
+    throw new Error("A valid term code is required before resolving prerequisites.");
+  }
   const cacheKey = `${term}|${normalized}`;
   if (webregCache.prerequisites.has(cacheKey)) return webregCache.prerequisites.get(cacheKey);
 
@@ -1968,9 +2251,10 @@ function normalizeCourseCode(raw) {
 
 async function fetchLoadGroupData(courseCode, termCode) {
   const normalized = normalizeCourseCode(courseCode);
-  const term = String(termCode || DEFAULT_TERM_CODE).toUpperCase();
-  const cacheKey = `${term}|${normalized}`;
-  if (webregCache.loadGroupData.has(cacheKey)) return webregCache.loadGroupData.get(cacheKey);
+  const term = normalizeTermCode(termCode);
+  if (!term) {
+    throw new Error("A valid term code is required before loading section data.");
+  }
 
   const [subj, num] = normalized.split(" ");
   const url =
@@ -1979,14 +2263,18 @@ async function fetchLoadGroupData(courseCode, termCode) {
     `&termcode=${encodeURIComponent(term)}` +
     `&_=${Date.now()}`;
   const rows = await fetchWebRegJson(url);
-  const parsed = window.ScheduleEngine.parseLoadGroupDataRows(rows, normalized);
-  webregCache.loadGroupData.set(cacheKey, parsed);
-  return parsed;
+  return window.ScheduleEngine.parseLoadGroupDataRows(rows, normalized);
 }
 
 async function populateCoursesFromAudit(parsedAudit) {
   const statusEl = document.getElementById("audit-courses-status");
-  const termCode = getCurrentTermCode();
+  const termCode = ensureTermCodeForAction("loading required courses", statusEl);
+  if (!termCode) {
+    courses.length = 0;
+    renderCourseList();
+    syncPassLists();
+    return;
+  }
 
   const pending = extractPendingSubrequirements(parsedAudit);
   if (!pending.length) {
@@ -2000,7 +2288,9 @@ async function populateCoursesFromAudit(parsedAudit) {
   statusEl.textContent = `Resolving required courses and prerequisites for ${termCode}...`;
 
   let autoCodes = [];
+  let termCatalog = new Map();
   try {
+    termCatalog = await fetchTermCourseCatalog(termCode);
     autoCodes = await resolveAutoCourses(parsedAudit, termCode);
   } catch (error) {
     statusEl.textContent = error?.message || "Could not resolve course list from WebReg.";
@@ -2009,10 +2299,11 @@ async function populateCoursesFromAudit(parsedAudit) {
 
   courses.length = 0;
   for (const code of autoCodes) {
+    const meta = termCatalog.get(code);
     courses.push({
       code,
-      name: code,
-      units: "TBD",
+      name: meta?.title || code,
+      units: formatUnitsForDisplay(meta?.units),
       instructors: [],
     });
   }
@@ -2462,33 +2753,101 @@ async function refreshBrowserUseProfileStatus() {
 }
 
 async function ensureVerifiedProfileForScheduling() {
+  const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid || null;
+  if (!pid) {
+    throw new Error("Fetch your degree audit first so we can verify your PID.");
+  }
   const state = await refreshBrowserUseProfileStatus();
   if (!state.hasProfile) {
     throw new Error("Browser Use profile is not verified for this PID yet.");
   }
+  return { pid, profileId: state.profileId || null };
+}
+
+function pushScheduleDebug(message, details = null) {
+  if (details != null) {
+    console.debug(`[schedule-debug] ${message}`, details);
+  } else {
+    console.debug(`[schedule-debug] ${message}`);
+  }
+  pushDegreeAuditDebug(`[schedule] ${message}`);
+}
+
+function buildUnavailableReason(parsed) {
+  const debug = parsed?.debug || null;
+  if (!debug) return "No active sections were parsed.";
+
+  if (debug.totalRows === 0) {
+    return "WebReg returned zero rows for this course.";
+  }
+
+  const bits = [];
+  const skipped = debug.skippedByReason || {};
+  if (skipped.cancelled_status) bits.push(`${skipped.cancelled_status} row(s) had status=CA`);
+  if (skipped.cancelled_zero_signature) {
+    bits.push(`${skipped.cancelled_zero_signature} row(s) matched the zeroed cancelled signature`);
+  }
+  if (skipped.missing_section_id) bits.push(`${skipped.missing_section_id} row(s) had no section id`);
+  if (debug.sectionsWithoutMeetings > 0 && debug.sectionsWithoutMeetings === debug.sectionCount) {
+    bits.push("all parsed sections had no usable day/time meetings");
+  }
+
+  if (!bits.length) return "No active sections remained after parsing.";
+  return bits.join("; ");
 }
 
 async function loadCourseEntriesForTerm(courseCodes, termCode) {
   const entries = [];
+  const unavailable = [];
   for (const code of courseCodes) {
     const parsed = await fetchLoadGroupData(code, termCode);
-    if (!parsed?.sections?.length) continue;
+    if (!parsed?.sections?.length) {
+      unavailable.push({
+        code,
+        reason: buildUnavailableReason(parsed),
+        debug: parsed?.debug || null,
+      });
+      continue;
+    }
     entries.push({ code, sections: parsed.sections });
   }
-  return entries;
+
+  const dedupedUnavailable = [];
+  const seen = new Set();
+  for (const item of unavailable) {
+    if (!item?.code || seen.has(item.code)) continue;
+    seen.add(item.code);
+    dedupedUnavailable.push(item);
+  }
+
+  return {
+    entries,
+    unavailable: dedupedUnavailable,
+  };
 }
 
-async function getCachedEvalForProfessor(name, courseCode) {
+function normalizeProfessorEvalKey(name, courseCode) {
+  return `${String(name || "").replace(/\s+/g, " ").trim()}|${normalizeCourseCode(courseCode)}`;
+}
+
+async function ensureEvalForProfessor(pid, name, courseCode) {
   const normalizedName = String(name || "").replace(/\s+/g, " ").trim();
   if (!normalizedName || /^staff$/i.test(normalizedName)) return null;
 
-  const cacheKey = `${normalizedName}|${normalizeCourseCode(courseCode)}`;
+  const normalizedCourseCode = normalizeCourseCode(courseCode);
+  const cacheKey = normalizeProfessorEvalKey(normalizedName, normalizedCourseCode);
   if (webregCache.evals.has(cacheKey)) return webregCache.evals.get(cacheKey);
 
-  const url =
-    `${API_BASE}/api/evals/professor?name=${encodeURIComponent(normalizedName)}` +
-    `&courseCode=${encodeURIComponent(normalizeCourseCode(courseCode))}`;
-  const res = await fetch(url);
+  const res = await fetch(`${API_BASE}/api/evals/professor/ensure`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      pid,
+      name: normalizedName,
+      courseCode: normalizedCourseCode,
+    }),
+  });
+
   if (!res.ok) {
     webregCache.evals.set(cacheKey, null);
     return null;
@@ -2499,16 +2858,76 @@ async function getCachedEvalForProfessor(name, courseCode) {
   return value;
 }
 
-async function enrichEntriesWithCachedEvaluations(entries) {
+async function runWithConcurrency(items, limit, worker) {
+  const cappedLimit = Math.max(1, Math.min(limit, items.length || 1));
+  let idx = 0;
+
+  const runners = Array.from({ length: cappedLimit }, () => (async () => {
+    while (idx < items.length) {
+      const current = items[idx];
+      idx += 1;
+      await worker(current);
+    }
+  })());
+
+  await Promise.all(runners);
+}
+
+function collectInstructorCoursePairs(entries) {
+  const pairs = [];
+  const seen = new Set();
   for (const entry of entries) {
     for (const section of entry.sections || []) {
-      const evals = await getCachedEvalForProfessor(section.instructor, entry.code);
+      const normalizedName = String(section.instructor || "").replace(/\s+/g, " ").trim();
+      if (!normalizedName || /^staff$/i.test(normalizedName)) continue;
+      const key = normalizeProfessorEvalKey(normalizedName, entry.code);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pairs.push({ key, name: normalizedName, courseCode: entry.code });
+    }
+  }
+  return pairs;
+}
+
+async function enrichEntriesWithEnsuredEvaluations(entries, pid) {
+  const pairs = collectInstructorCoursePairs(entries);
+  const failedPairs = [];
+
+  await runWithConcurrency(pairs, 4, async pair => {
+    try {
+      await ensureEvalForProfessor(pid, pair.name, pair.courseCode);
+    } catch {
+      failedPairs.push(`${pair.name} (${pair.courseCode})`);
+    }
+  });
+
+  for (const entry of entries) {
+    for (const section of entry.sections || []) {
+      const key = normalizeProfessorEvalKey(section.instructor, entry.code);
+      const evals = webregCache.evals.get(key) || null;
       if (!evals) continue;
       if (evals.rmp?.score != null) section.rmp_quality = evals.rmp.score;
       if (evals.cape?.recommendProf != null) section.cape_recommend_prof = evals.cape.recommendProf;
       if (evals.cape?.avgHoursPerWeek != null) section.capeHours = evals.cape.avgHoursPerWeek;
     }
   }
+
+  return {
+    pairCount: pairs.length,
+    failedPairs,
+  };
+}
+
+function setResultsWarning(message) {
+  const warningEl = document.getElementById("sched-warning");
+  if (!warningEl) return;
+  if (!message) {
+    warningEl.style.display = "none";
+    warningEl.textContent = "";
+    return;
+  }
+  warningEl.style.display = "block";
+  warningEl.textContent = message;
 }
 
 async function launchResults() {
@@ -2530,27 +2949,53 @@ async function launchResults() {
   document.getElementById("sched-label").textContent = "Generating...";
   document.getElementById("sched-score-badge").textContent = "-";
   document.getElementById("score-breakdown").innerHTML = "";
+  setResultsWarning("");
+  webregCache.evals.clear();
 
   try {
-    await ensureVerifiedProfileForScheduling();
+    const { pid } = await ensureVerifiedProfileForScheduling();
 
-    const termCode = getCurrentTermCode();
-    const selectedCodes = courses.slice(0, 4).map(c => normalizeCourseCode(c.code));
-    const entries = await loadCourseEntriesForTerm(selectedCodes, termCode);
-    if (entries.length === 0) {
-      throw new Error(`No selected courses returned schedule data for ${termCode}.`);
+    const termCode = ensureTermCodeForAction("generating schedules");
+    if (!termCode) {
+      throw new Error("Detect your WebReg term or enter it manually before generating schedules.");
     }
 
-    await enrichEntriesWithCachedEvaluations(entries);
+    const selectedCodes = courses.slice(0, 4).map(c => normalizeCourseCode(c.code));
+    const { entries, unavailable } = await loadCourseEntriesForTerm(selectedCodes, termCode);
+    const warnings = [];
+    if (unavailable.length) {
+      warnings.push(`Skipped unavailable/cancelled courses: ${unavailable.map(item => item.code).join(", ")}`);
+      for (const item of unavailable) {
+        pushScheduleDebug(`Skipped ${item.code}: ${item.reason}`, item.debug);
+      }
+    }
+    setResultsWarning(warnings.join(" | "));
+    if (entries.length === 0) {
+      throw new Error(`No selected courses returned active section data for ${termCode}.`);
+    }
+
+    const evalSummary = await enrichEntriesWithEnsuredEvaluations(entries, pid);
+    if (evalSummary.failedPairs.length) {
+      warnings.push(`Some professor evaluations could not be refreshed (${evalSummary.failedPairs.length}).`);
+    }
+    setResultsWarning(warnings.join(" | "));
 
     const prefs = getCurrentPrefs();
     const generated = window.ScheduleEngine.generateSchedules(entries, {
       allowOverlaps: !prefs.requireNoConflicts,
       maxCandidates: 2000,
     });
+    if (generated.missing?.length) {
+      for (const code of generated.missing) {
+        pushScheduleDebug(
+          `Skipped ${code} during bundle generation: no valid lecture/discussion bundle remained after filtering.`
+        );
+      }
+    }
 
     let candidateSchedules = generated.schedules || [];
     if (prefs.hardNoFriday) {
+      const beforeFridayFilter = candidateSchedules.length;
       candidateSchedules = candidateSchedules.filter(schedule =>
         !(schedule.sections || []).some(section =>
           (section.meetings || []).some(meeting =>
@@ -2558,13 +3003,21 @@ async function launchResults() {
           )
         )
       );
+      const removedByFridayFilter = beforeFridayFilter - candidateSchedules.length;
+      if (removedByFridayFilter > 0) {
+        pushScheduleDebug(`Filtered ${removedByFridayFilter} schedule(s) because "No Friday classes" is enabled.`);
+      }
     }
 
     if (!candidateSchedules.length) {
       const msg = "No valid schedules found for the selected courses and constraints.";
       document.getElementById("sched-label").textContent = msg;
-      document.getElementById("results-content").style.display = "none";
-      document.getElementById("results-empty").style.display = "flex";
+      activeSchedules = [];
+      currentScheduleIdx = 0;
+      document.getElementById("sched-prev").disabled = true;
+      document.getElementById("sched-next").disabled = true;
+      document.getElementById("cal-body").innerHTML = "";
+      hideSectionDetail();
       return;
     }
 
@@ -2941,7 +3394,10 @@ document.getElementById("remove-planned-btn").addEventListener("click", async ()
     return;
   }
 
-  const termCode = getCurrentTermCode();
+  const termCode = ensureTermCodeForAction("removing planned classes", statusEl);
+  if (!termCode) {
+    return;
+  }
   statusEl.textContent = `Removing planned classes for ${termCode}...`;
   const removeBtn = document.getElementById("remove-planned-btn");
   removeBtn.disabled = true;
@@ -2969,5 +3425,3 @@ document.getElementById("remove-planned-btn").addEventListener("click", async ()
     removeBtn.disabled = false;
   }
 });
-
-void refreshBrowserUseProfileStatus();

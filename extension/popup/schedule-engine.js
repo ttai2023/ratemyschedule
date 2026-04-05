@@ -77,13 +77,72 @@
     ].join("|");
   }
 
+  function toSafeNumber(value) {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : 0;
+  }
+
+  function hasNonEmptySchedulePayload(row) {
+    const dayCode = String(row?.DAY_CODE || "").trim();
+    const startDate = String(row?.START_DATE || "").trim();
+    return Boolean(dayCode || startDate);
+  }
+
+  function hasZeroCancelledSignature(row) {
+    return (
+      toSafeNumber(row?.BEGIN_HH_TIME) === 0 &&
+      toSafeNumber(row?.BEGIN_MM_TIME) === 0 &&
+      toSafeNumber(row?.END_HH_TIME) === 0 &&
+      toSafeNumber(row?.END_MM_TIME) === 0 &&
+      toSafeNumber(row?.SCTN_CPCTY_QTY) === 0 &&
+      toSafeNumber(row?.SCTN_ENRLT_QTY) === 0 &&
+      toSafeNumber(row?.COUNT_ON_WAITLIST) === 0 &&
+      toSafeNumber(row?.AVAIL_SEAT) === 0 &&
+      !hasNonEmptySchedulePayload(row)
+    );
+  }
+
+  function describeSkipReason(row) {
+    const status = String(row?.FK_SST_SCTN_STATCD || "").trim().toUpperCase();
+    if (status === "CA") return "cancelled_status";
+    if (hasZeroCancelledSignature(row)) return "cancelled_zero_signature";
+    if (!String(row?.SECT_CODE || "").trim()) return "missing_section_id";
+    return null;
+  }
+
   function parseLoadGroupDataRows(rows, courseCode) {
     const normalizedCode = normalizeCourseCode(courseCode);
     const bySection = new Map();
+    const debug = {
+      totalRows: Array.isArray(rows) ? rows.length : 0,
+      keptRows: 0,
+      skippedRows: 0,
+      skippedByReason: {
+        cancelled_status: 0,
+        cancelled_zero_signature: 0,
+        missing_section_id: 0,
+        no_day_time_payload: 0,
+      },
+      sectionCount: 0,
+      sectionsWithoutMeetings: 0,
+    };
 
     for (const row of rows || []) {
+      const skipReason = describeSkipReason(row);
+      if (skipReason) {
+        debug.skippedRows += 1;
+        debug.skippedByReason[skipReason] += 1;
+        continue;
+      }
+
       const sectionId = String(row?.SECT_CODE || "").trim();
-      if (!sectionId) continue;
+      if (!sectionId) {
+        debug.skippedRows += 1;
+        debug.skippedByReason.missing_section_id += 1;
+        continue;
+      }
+
+      debug.keptRows += 1;
 
       const type = String(row?.FK_CDI_INSTR_TYPE || "").trim() || "LE";
       const status = String(row?.FK_SST_SCTN_STATCD || "").trim() || "";
@@ -136,7 +195,10 @@
         continue;
       }
 
-      if (!days) continue;
+      if (!days) {
+        debug.skippedByReason.no_day_time_payload += 1;
+        continue;
+      }
       const meeting = { days, start, end, building, room };
       const dedupe = new Set(section.meetings.map(meetingKey));
       if (!dedupe.has(meetingKey(meeting))) {
@@ -144,9 +206,14 @@
       }
     }
 
+    const sections = [...bySection.values()].sort((a, b) => String(a.section_id).localeCompare(String(b.section_id)));
+    debug.sectionCount = sections.length;
+    debug.sectionsWithoutMeetings = sections.filter(section => !(section.meetings || []).length).length;
+
     return {
       code: normalizedCode,
-      sections: [...bySection.values()].sort((a, b) => String(a.section_id).localeCompare(String(b.section_id))),
+      sections,
+      debug,
     };
   }
 
