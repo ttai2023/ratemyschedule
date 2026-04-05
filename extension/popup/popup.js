@@ -9,7 +9,7 @@ document.querySelectorAll(".tab").forEach(tab => {
 });
 
 // ── Course Selection ───────────────────────────────────────────
-const API_BASE = "http://localhost:3000";
+const API_BASE = "http://localhost:3001";
 
 // courses: array of { code, name, units, instructors: [{name, rmp}] }
 const courses = [];
@@ -1493,12 +1493,22 @@ async function runSearch() {
   const container = document.getElementById("search-results");
   container.innerHTML = '<p class="search-loading">Searching…</p>';
 
+  // Build query: prefer dept+q combo, fall back to whichever is set
+  const query = [dept, q].filter(Boolean).join(" ");
   try {
-    const params = new URLSearchParams({ dept, q });
-    const res  = await fetch(`${API_BASE}/api/courses/search?${params}`);
+    const params = new URLSearchParams({ q: query });
+    const res  = await fetch(`${API_BASE}/api/search?${params}`);
     if (!res.ok) throw new Error("API error");
     const data = await res.json();
-    renderSearchResults(data);
+    // API returns { results: [{course_code, instructors, section_count}], count }
+    // Map to display shape: {code, name, units, instructors:[{name}]}
+    const mapped = (data.results ?? []).map(r => ({
+      code:        r.course_code,
+      name:        r.course_code,  // WebReg doesn't return a long name — use code for now
+      units:       r.section_count + " sec",
+      instructors: (r.instructors ?? []).map(n => ({ name: n, rmp: null })),
+    }));
+    renderSearchResults(mapped);
   } catch {
     container.innerHTML = '<p class="search-error">Could not reach API. Is the server running?</p>';
   }
@@ -1842,12 +1852,181 @@ function fmtTime(t) {
 document.getElementById("run-btn").addEventListener("click", launchResults);
 document.getElementById("run-btn-rerun").addEventListener("click", launchResults);
 
-function launchResults() {
-  activeSchedules = PLACEHOLDER_SCHEDULES; // swap with API call later
-  currentScheduleIdx = 0;
+/**
+ * Read weights from the priorities UI.
+ * Uses data-id on each <li> ("professor","time","finals","days","difficulty")
+ * so it's label-text-independent.
+ * Returns { professor: N, time: N, ... } where values are 0–100 integers
+ * computed by computeWeights() with the current weightMode curve.
+ */
+function getCurrentWeights() {
+  const items = [...document.querySelectorAll("#priority-list li")];
+  const vals  = computeWeights(items.length, weightMode);
+  const w = {};
+  items.forEach((item, i) => {
+    const key = item.dataset.id;   // "professor" | "time" | "finals" | "days" | "difficulty"
+    if (key) w[key] = vals[i];
+  });
+  return w;
+}
+
+/**
+ * Parse "9:00 AM" / "3:00 PM" select values → minutes since midnight.
+ * Returns null for unrecognised values.
+ */
+function parseTimeOption(str) {
+  if (!str) return null;
+  const m = str.match(/(\d+):(\d+)\s*(AM|PM)/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const pm  = m[3].toUpperCase() === "PM";
+  if (pm && h !== 12) h += 12;
+  if (!pm && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+/**
+ * Derive a dayPattern string from the individual day-btn toggles.
+ *   All active          → "any"
+ *   Only M/W/F active   → "MWF"
+ *   Only Tu/Th active   → "TuTh"
+ *   Fewer days than 5   → "minimize"
+ */
+function getDayPattern() {
+  const active = new Set(
+    [...document.querySelectorAll(".day-btn.active")].map(b => b.dataset.day)
+  );
+  if (active.size === 5) return "any";
+  const mwf  = active.has("Mon") && active.has("Wed") && active.has("Fri") &&
+               !active.has("Tue") && !active.has("Thu");
+  const tuth = active.has("Tue") && active.has("Thu") &&
+               !active.has("Mon") && !active.has("Wed") && !active.has("Fri");
+  if (mwf)  return "MWF";
+  if (tuth) return "TuTh";
+  return "minimize";
+}
+
+/**
+ * Read all preferences from the preferences UI.
+ * Handles time selects, day pattern, and hard-constraint checkboxes.
+ */
+function getCurrentPrefs() {
+  const prefs = {};
+
+  const ps = parseTimeOption(document.getElementById("pref-start")?.value);
+  const pe = parseTimeOption(document.getElementById("pref-end")?.value);
+  if (ps != null) prefs.prefStart = ps;
+  if (pe != null) prefs.prefEnd   = pe;
+
+  prefs.dayPattern = getDayPattern();
+
+  // Hard constraint checkboxes
+  const hardLimits = {};
+  if (document.getElementById("c-no-8am")?.checked) {
+    hardLimits.neverBefore = 8 * 60;   // any meeting starting at/before 8:00 → score 0
+  }
+  if (Object.keys(hardLimits).length) prefs.hardLimits = hardLimits;
+
+  return prefs;
+}
+
+/** Expand "MWF" → ["M","W","F"], handling two-char Tu/Th */
+function expandDaysJS(str) {
+  const out = []; let i = 0;
+  while (i < str.length) {
+    const two = str.slice(i, i+2);
+    if (two==="Tu"||two==="Th"||two==="Sa"||two==="Su") { out.push(two); i+=2; }
+    else { out.push(str[i]); i+=1; }
+  }
+  return out;
+}
+
+const DAY_TO_COL = { M:1, Tu:2, W:3, Th:4, F:5 };
+
+/** Convert real API section → calendar/detail display shape */
+function adaptSection(sec, fallbackIdx) {
+  const ci = courses.findIndex(c => c.code === sec.courseCode);
+  const colorIdx = (ci >= 0 ? ci : fallbackIdx) % COURSE_COLORS.length;
+  const flatDays = (sec.meetings ?? []).flatMap(m =>
+    expandDaysJS(m.days ?? "").map(d => DAY_TO_COL[d]).filter(Boolean)
+  );
+  const first = sec.meetings?.[0] ?? {};
+  const room  = first.building ? `${first.building} ${first.room ?? ""}`.trim() : (first.room ?? "TBA");
+  const finalStr = sec.final
+    ? `${sec.final.date} ${sec.final.start}–${sec.final.end}`
+    : "TBA";
+  return {
+    code: sec.courseCode,
+    name: sec.courseCode,
+    days: [...new Set(flatDays)],
+    start: first.start ?? "00:00",
+    end:   first.end   ?? "00:00",
+    instructor: sec.instructor ?? "TBA",
+    rmp:  sec.rmp_quality,
+    cape: { hours: sec.capeHours, recommend: sec.cape_recommend_prof, grade: null },
+    room, final: finalStr, colorIdx,
+    seats_available: sec.seats_available,
+    status: sec.status,
+  };
+}
+
+async function launchResults() {
+  if (courses.length === 0) {
+    alert("Add at least one course first.");
+    return;
+  }
+
+  // Switch to results tab and show loading state
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === "results"));
+  document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-results"));
   document.getElementById("results-empty").style.display = "none";
   document.getElementById("results-content").style.display = "flex";
-  renderSchedule();
+  document.getElementById("sched-label").textContent = "Generating…";
+  document.getElementById("sched-score-badge").textContent = "–";
+  document.getElementById("score-breakdown").innerHTML = "";
+
+  try {
+    const res = await fetch(`${API_BASE}/api/recommend`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        courses:  courses.map(c => c.code),
+        topN:     5,
+        weights:  getCurrentWeights(),
+        prefs:    getCurrentPrefs(),
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    if (!data.schedules?.length) {
+      const missing = data.meta?.missing?.join(", ");
+      const msg = missing
+        ? `No valid schedules — courses not found: ${missing}`
+        : "No valid schedules found (all combinations conflict)";
+      document.getElementById("sched-label").textContent = msg;
+      document.getElementById("results-content").style.display = "none";
+      document.getElementById("results-empty").style.display = "flex";
+      return;
+    }
+
+    activeSchedules = data.schedules.map(sched => ({
+      score:     sched.score,
+      breakdown: sched.breakdown,
+      summary:   sched.summary ?? "",
+      sections:  sched.sections.map((sec, i) => adaptSection(sec, i)),
+    }));
+    currentScheduleIdx = 0;
+    renderSchedule();
+  } catch (err) {
+    document.getElementById("sched-label").textContent = "Error — " + err.message;
+  }
 }
 
 function renderSchedule() {
@@ -1855,8 +2034,9 @@ function renderSchedule() {
   const n = activeSchedules.length;
 
   // Nav
-  document.getElementById("sched-label").textContent =
-    `Schedule ${currentScheduleIdx + 1} of ${n}`;
+  const labelMain = `Schedule ${currentScheduleIdx + 1} of ${n}`;
+  const labelSub  = s.summary ? ` — ${s.summary}` : "";
+  document.getElementById("sched-label").textContent = labelMain + labelSub;
   document.getElementById("sched-prev").disabled = currentScheduleIdx === 0;
   document.getElementById("sched-next").disabled = currentScheduleIdx === n - 1;
 
@@ -1957,19 +2137,31 @@ function showSectionDetail(sec, clr) {
   panel.style.borderTopColor = clr.border;
   document.getElementById("detail-code").textContent = sec.code;
   document.getElementById("detail-name").textContent = sec.name;
+
+  const rmpHtml  = sec.rmp  != null ? ` <span class="rmp-badge">★${sec.rmp.toFixed(1)}</span>` : "";
+  const capeGrade = sec.cape?.grade    ? `Avg ${esc(sec.cape.grade)} · ` : "";
+  const capeHrs   = sec.cape?.hours    != null ? `${sec.cape.hours}h/wk · ` : "";
+  const capeRec   = sec.cape?.recommend != null ? `${sec.cape.recommend}% rec` : "";
+  const capeHtml  = (capeGrade || capeHrs || capeRec) ? (capeGrade + capeHrs + capeRec) : "No CAPE data";
+
+  const seatsHtml = sec.seats_available != null
+    ? `<div class="detail-row"><span class="detail-lbl">Seats</span><span>${sec.seats_available} open</span></div>`
+    : "";
+
   document.getElementById("detail-body").innerHTML = `
     <div class="detail-row">
       <span class="detail-lbl">Instructor</span>
-      <span>${esc(sec.instructor)} <span class="rmp-badge">★${sec.rmp}</span></span>
+      <span>${esc(sec.instructor)}${rmpHtml}</span>
     </div>
     <div class="detail-row">
       <span class="detail-lbl">CAPE</span>
-      <span>Avg ${esc(sec.cape.grade)} · ${sec.cape.hours}h/wk · ${sec.cape.recommend}% rec</span>
+      <span>${capeHtml}</span>
     </div>
     <div class="detail-row">
       <span class="detail-lbl">Room</span>
       <span>${esc(sec.room)}</span>
     </div>
+    ${seatsHtml}
     <div class="detail-row">
       <span class="detail-lbl">Final</span>
       <span>${esc(sec.final)}</span>
@@ -2028,9 +2220,16 @@ function autoAssignPasses() {
   }
 
   passAssignments = source.map((s, i) => {
-    const meta = PASS_META[s.code] ?? defaultMeta(s.code, i);
-    const autoPass = meta.difficulty === "Hard" || meta.seats < 30 ? "first" : "second";
-    return { ...s, ...meta, pass: autoPass };
+    // Use real seats_available if we have it from the API, else fall back to PASS_META
+    const realSeats  = s.seats_available;
+    const hasMeta    = realSeats != null;
+    const seats      = hasMeta ? realSeats : (PASS_META[s.code]?.seats ?? defaultMeta(s.code, i).seats);
+    const difficulty = seats <= 15 ? "Hard" : seats <= 35 ? "Medium" : "Easy";
+    const reason     = hasMeta
+      ? `${seats} seat${seats !== 1 ? "s" : ""} available`
+      : (PASS_META[s.code]?.reason ?? defaultMeta(s.code, i).reason);
+    const autoPass   = difficulty === "Hard" || seats < 30 ? "first" : "second";
+    return { ...s, seats, difficulty, reason, pass: autoPass };
   });
 
   renderPassColumns();

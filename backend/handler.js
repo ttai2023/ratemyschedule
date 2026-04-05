@@ -45,3 +45,5 @@ function handleRank(req, res) {
   const ranked = rankSchedules(candidates, normWeights, resolvedPrefs);
   res.json(ranked);
 }
+
+export { handleRank };

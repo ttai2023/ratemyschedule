@@ -2,149 +2,265 @@
  * scorer.js
  *
  * Normalises each criterion to [0, 1] before weighting so that raw
- * magnitudes (RMP on a 1-5 scale, hours as a count, etc.) never
- * dominate the result.
+ * magnitudes never dominate. Final score = Σ(weight_i × score_i) × 100.
  *
- * Final schedule score = Σ(weight_i × normalised_score_i), scaled to 0–100.
+ * Expected section shape (from WebReg + RMP/CAPE enrichment):
+ * {
+ *   instructor:          string,
+ *   rmp_quality?:        number,   // 1–5  (from RMP)
+ *   cape_recommend_prof?:number,   // 0–100 (% who recommend prof, from CAPE)
+ *   capeHours?:          number,   // avg hrs/wk (from CAPE)
+ *   meetings: [{
+ *     days:  string,               // "MWF" | "TuTh" | "M" | "Tu" | ...
+ *     start: string,               // "10:00"  (24-h HH:MM)
+ *     end:   string,               // "10:50"
+ *   }],
+ *   final?: {
+ *     date:  string,               // "2026-08-15"
+ *     start: string,               // "08:00"
+ *     end:   string,               // "11:00"
+ *   } | null,
+ * }
  *
- * Section shape expected by these functions:
- *   {
- *     rmp?:       number,           // RMP rating 1–5
- *     meetings?:  { day: string,    // "Mon" | "Tue" | ...
- *                   start: number,  // minutes since midnight
- *                   end:   number },
- *     finalTime?: Date | number,    // ms timestamp or Date object
- *     capeHours?: number,           // avg hrs/wk from CAPE
- *   }
+ * prefs shape (passed to scoreSchedule / rankSchedules):
+ * {
+ *   prefStart?:    number,   // preferred window start, minutes (default 600 = 10 AM)
+ *   prefEnd?:      number,   // preferred window end,   minutes (default 960 = 4 PM)
+ *   hardLimits?: {
+ *     neverBefore?: number,  // hard cutoff — any meeting starting at/before this → 0
+ *     neverAfter?:  number,  // hard cutoff — any meeting ending at/after this   → 0
+ *   },
+ *   dayPattern?:   "MWF" | "TuTh" | "minimize" | "any",  // default "any"
+ *   minHours?:     number,   // comfortable load lower bound (default 12)
+ *   maxHours?:     number,   // comfortable load upper bound (default 20)
+ * }
  */
 
-"use strict";
+// ── Internal helpers ──────────────────────────────────────────
 
-// ── Individual normalised scoring functions ───────────────────
-
-/**
- * Professor quality.
- * Maps RMP 1–5 → 0–1 linearly: (rmp - 1) / 4
- * Averages across all sections in the schedule.
- * Falls back to 0.5 when no RMP data is available.
- */
-function scoreRmp(sections) {
-  const rated = sections.filter(s => s.rmp != null && s.rmp >= 1);
-  if (!rated.length) return 0.5;
-  const mean = rated.reduce((sum, s) => sum + s.rmp, 0) / rated.length;
-  return Math.min(1, Math.max(0, (mean - 1) / 4));
+/** "HH:MM" → minutes since midnight. Also accepts a number (pass-through). */
+function toMins(t) {
+  if (typeof t === "number") return t;
+  const [h, m = 0] = String(t).split(":").map(Number);
+  return h * 60 + m;
 }
 
 /**
- * Time-of-day preference.
+ * "MWF" → ["M","W","F"],  "TuTh" → ["Tu","Th"],  "M" → ["M"]
+ * Two-char codes (Tu, Th) are parsed before single-char codes.
+ */
+function expandDays(daysStr) {
+  const out = [];
+  let i = 0;
+  while (i < daysStr.length) {
+    const two = daysStr.slice(i, i + 2);
+    if (two === "Tu" || two === "Th") { out.push(two); i += 2; }
+    else                              { out.push(daysStr[i]); i += 1; }
+  }
+  return out;
+}
+
+/** Section → final exam timestamp (ms), or null if no final data. */
+function finalMs(sec) {
+  if (!sec.final?.date || !sec.final?.start) return null;
+  const ts = Date.parse(`${sec.final.date}T${sec.final.start}`);
+  return isNaN(ts) ? null : ts;
+}
+
+const clamp = (v, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, v));
+
+// ── 1. Professor quality ──────────────────────────────────────
+
+/**
+ * Blends RMP overall quality and CAPE "recommend professor" into one score.
  *
- * Returns 1.0 when every meeting falls fully inside [prefStart, prefEnd].
- * Penalises proportionally to the fraction of meeting time outside the window.
- * Averages the per-meeting scores across all meetings in the schedule.
+ *   rmp_norm  = (rmp_quality - 1) / 4          maps 1–5 → 0–1
+ *   cape_norm = cape_recommend_prof / 100       maps 0–100% → 0–1
+ *   blend     = 0.6 × rmp_norm + 0.4 × cape_norm  (when both available)
+ *
+ * Falls back to whichever source exists, or 0.5 if neither.
+ * Averages the blended score across all sections in the schedule.
+ */
+function scoreProfessor(sections) {
+  const scored = sections.map(s => {
+    const hasRmp  = s.rmp_quality        != null && s.rmp_quality >= 1;
+    const hasCape = s.cape_recommend_prof != null;
+
+    if (!hasRmp && !hasCape) return null;
+
+    const rmpNorm  = hasRmp  ? (s.rmp_quality - 1) / 4          : null;
+    const capeNorm = hasCape ? s.cape_recommend_prof / 100       : null;
+
+    if (rmpNorm  != null && capeNorm != null) return 0.6 * rmpNorm + 0.4 * capeNorm;
+    if (rmpNorm  != null)                     return rmpNorm;
+    return capeNorm;
+  }).filter(v => v != null);
+
+  if (!scored.length) return 0.5;
+  return clamp(scored.reduce((a, b) => a + b, 0) / scored.length);
+}
+
+// ── 2. Time-of-day preference ─────────────────────────────────
+
+/**
+ * Scores how well meeting times fit the user's preferred window.
+ *
+ * For each meeting:
+ *   - Hard limit triggered (neverBefore / neverAfter) → 0.0 for that meeting
+ *   - Fully inside [prefStart, prefEnd]               → 1.0
+ *   - Partially/fully outside                         → linear decay based on
+ *     total minutes outside the window, capped at 3 hours (180 min) → 0.0
+ *
+ * Final score = mean across all meetings in the schedule.
  *
  * @param {Array}  sections
- * @param {number} prefStart  Minutes since midnight (e.g. 9*60 = 540 for 9 AM)
- * @param {number} prefEnd    Minutes since midnight (e.g. 17*60 = 1020 for 5 PM)
+ * @param {number} prefStart   minutes (default 600 = 10 AM)
+ * @param {number} prefEnd     minutes (default 960  =  4 PM)
+ * @param {Object} hardLimits  { neverBefore?, neverAfter? }
  */
-function scoreTime(sections, prefStart, prefEnd) {
+function scoreTime(sections, prefStart = 600, prefEnd = 960, hardLimits = {}) {
   const meetings = sections.flatMap(s => s.meetings ?? []);
   if (!meetings.length) return 0.5;
 
+  const DECAY_WINDOW = 180; // minutes — full decay range outside preferred window
+
   const scores = meetings.map(m => {
-    if (m.start >= prefStart && m.end <= prefEnd) return 1.0;
-    const earlyOverlap = Math.max(0, prefStart - m.start);
-    const lateOverlap  = Math.max(0, m.end   - prefEnd);
-    const duration     = m.end - m.start;
-    if (duration <= 0) return 0.5;
-    return Math.max(0, 1 - (earlyOverlap + lateOverlap) / duration);
+    const start = toMins(m.start);
+    const end   = toMins(m.end);
+
+    // Hard limits — instant zero
+    if (hardLimits.neverBefore != null && start <= hardLimits.neverBefore) return 0;
+    if (hardLimits.neverAfter  != null && end   >= hardLimits.neverAfter)  return 0;
+
+    if (start >= prefStart && end <= prefEnd) return 1.0;
+
+    const earlyMins = Math.max(0, prefStart - start);
+    const lateMins  = Math.max(0, end - prefEnd);
+    const outsideMins = earlyMins + lateMins;
+
+    return clamp(1 - outsideMins / DECAY_WINDOW);
   });
 
   return scores.reduce((a, b) => a + b, 0) / scores.length;
 }
 
+// ── 3. Final exam spread ──────────────────────────────────────
+
 /**
- * Finals spread.
+ * Scores how spread out the final exam schedule is.
  *
- * Scores the minimum gap between any two finals in the schedule:
- *   gap >= 48 hrs → 1.0 (two full days apart, perfect)
- *   gap == 0 hrs  → 0.0 (same timeslot, worst case)
- *   linear in between: min(gapHrs, 48) / 48
+ * Base score:
+ *   min gap between any two finals → min(gapHrs, 48) / 48
+ *   0 or 1 final → 1.0 (no conflict possible)
  *
- * Schedules with 0 or 1 final score 1.0 (no conflict possible).
+ * Crunch penalty:
+ *   If 3 or more finals fall within any 24-hour window, the score
+ *   is hard-capped at 0.15 (severe penalty regardless of base score).
  */
 function scoreFinals(sections) {
   const times = sections
-    .map(s => s.finalTime)
+    .map(finalMs)
     .filter(t => t != null)
-    .map(t => (t instanceof Date ? t.getTime() : Number(t)))
-    .filter(t => !isNaN(t))
     .sort((a, b) => a - b);
 
   if (times.length < 2) return 1.0;
 
+  // Base: minimum gap between consecutive finals
   let minGapMs = Infinity;
   for (let i = 1; i < times.length; i++) {
     minGapMs = Math.min(minGapMs, times[i] - times[i - 1]);
   }
+  const gapHrs   = minGapMs / (1000 * 60 * 60);
+  let baseScore  = Math.min(gapHrs, 48) / 48;
 
-  const gapHrs = minGapMs / (1000 * 60 * 60);
-  return Math.min(gapHrs, 48) / 48;
+  // Crunch penalty: 3+ finals within any 24-hour span
+  const MS_24H = 24 * 60 * 60 * 1000;
+  for (let i = 0; i + 2 < times.length; i++) {
+    if (times[i + 2] - times[i] <= MS_24H) {
+      baseScore = Math.min(baseScore, 0.15);
+      break;
+    }
+  }
+
+  return baseScore;
 }
 
+// ── 4. Day pattern preference ─────────────────────────────────
+
 /**
- * Days-off preference.
+ * Scores how well the schedule's day distribution matches the user's
+ * preferred pattern.
  *
- * Base score: fewer distinct class days = better.
- *   1 day  → 1.0
- *   5 days → 0.0
- *   linear: 1 - (classDays - 1) / 4
- *
- * If the user specified preferred days off, a 30% bonus is applied
- * based on the fraction of those days that are actually free.
- *
- * @param {Array} sections
- * @param {Set}   preferredDaysOff  e.g. new Set(["Fri"])
+ * Patterns:
+ *   "MWF"      → 1.0 if no TuTh classes, 0.5 if mixed, 0.3 if TuTh-only
+ *   "TuTh"     → 1.0 if no MWF classes,  0.5 if mixed, 0.3 if MWF-only
+ *   "minimize" → fewer distinct class days = better (1 day → 1.0, 5 → 0.0)
+ *   "any"      → neutral 0.5
  */
-function scoreDaysOff(sections, preferredDaysOff = new Set()) {
-  const classDays = new Set(
-    sections.flatMap(s => (s.meetings ?? []).map(m => m.day))
+function scoreDayPattern(sections, pattern = "any") {
+  if (pattern === "any") return 0.5;
+
+  const allDays = new Set(
+    sections.flatMap(s =>
+      (s.meetings ?? []).flatMap(m => expandDays(m.days ?? ""))
+    )
   );
 
-  const baseScore = Math.max(0, 1 - (classDays.size - 1) / 4);
+  if (pattern === "minimize") {
+    return clamp(1 - (allDays.size - 1) / 4);
+  }
 
-  if (!preferredDaysOff.size) return baseScore;
+  const MWF_DAYS  = new Set(["M", "W", "F"]);
+  const TUTH_DAYS = new Set(["Tu", "Th"]);
 
-  const freedCount = [...preferredDaysOff].filter(d => !classDays.has(d)).length;
-  const bonusFrac  = freedCount / preferredDaysOff.size;
+  const hasMWF  = [...allDays].some(d => MWF_DAYS.has(d));
+  const hasTuTh = [...allDays].some(d => TUTH_DAYS.has(d));
 
-  return Math.max(0, Math.min(1, baseScore * 0.7 + bonusFrac * 0.3));
+  if (pattern === "MWF") {
+    if (hasMWF && !hasTuTh) return 1.0;
+    if (hasMWF &&  hasTuTh) return 0.5;
+    return 0.3; // TuTh-only schedule when user wants MWF
+  }
+
+  if (pattern === "TuTh") {
+    if (hasTuTh && !hasMWF) return 1.0;
+    if (hasTuTh &&  hasMWF) return 0.5;
+    return 0.3;
+  }
+
+  return 0.5;
 }
 
+// ── 5. Difficulty / workload balance ─────────────────────────
+
 /**
- * Difficulty balance (via CAPE weekly hours).
+ * Uses CAPE avg_hours_per_week as a proxy for course difficulty.
+ * Sums across all sections in the schedule and scores against a
+ * comfortable target band [minHrs, maxHrs].
  *
- * Scores 1.0 when total estimated hrs/wk falls inside [minHrs, maxHrs].
- * Linear penalty outside the range:
- *   - Under-loaded: score = totalHrs / minHrs  (0 hrs → 0.0)
- *   - Over-loaded:  score decays to 0 at 2×maxHrs
+ *   Inside band            → 1.0
+ *   Under-loaded (<minHrs) → linear from 0.3 (0 hrs) to 1.0 (minHrs)
+ *                            (a light load isn't terrible, floor at 0.3)
+ *   Over-loaded  (>maxHrs) → linear decay to 0 at 2×maxHrs
+ *                            (a crushing load should dominate the penalty)
  *
- * Falls back to 0.5 when no CAPE data is available.
- *
- * @param {Array}  sections
- * @param {number} minHrs  Lower bound of comfortable range (default 10)
- * @param {number} maxHrs  Upper bound of comfortable range (default 20)
+ * Falls back to 0.5 when no CAPE data is available for any section.
  */
-function scoreDifficulty(sections, minHrs = 10, maxHrs = 20) {
+function scoreDifficulty(sections, minHrs = 12, maxHrs = 20) {
   const withData = sections.filter(s => s.capeHours != null);
   if (!withData.length) return 0.5;
 
   const total = withData.reduce((sum, s) => sum + s.capeHours, 0);
 
   if (total >= minHrs && total <= maxHrs) return 1.0;
-  if (total < minHrs) return Math.max(0, total / minHrs);
 
-  // Over-loaded: linear decay to 0 at 2× maxHrs
-  return Math.max(0, 1 - (total - maxHrs) / maxHrs);
+  if (total < minHrs) {
+    // Light load: interpolate from 0.3 (at 0 hrs) to 1.0 (at minHrs)
+    return clamp(0.3 + 0.7 * (total / minHrs));
+  }
+
+  // Heavy load: decay from 1.0 (at maxHrs) to 0.0 (at 2×maxHrs)
+  return clamp(1 - (total - maxHrs) / maxHrs);
 }
 
 // ── Aggregate scorer ─────────────────────────────────────────
@@ -152,47 +268,37 @@ function scoreDifficulty(sections, minHrs = 10, maxHrs = 20) {
 /**
  * Score one schedule candidate.
  *
- * @param {Object} schedule      Must have a `sections` array.
- *
- * @param {Object} weights       Normalised, must sum to 1.
+ * @param {Object} schedule   Must have a `sections` array (WebReg shape above).
+ * @param {Object} weights    Normalised weights summing to 1.
  *   { professor, time, finals, days, difficulty }
- *   Use computeWeights() in the extension's popup.js to produce this.
- *
- * @param {Object} [prefs]       User preference overrides.
- *   {
- *     prefStart?:        number,   // minutes (default 540 = 9 AM)
- *     prefEnd?:          number,   // minutes (default 1020 = 5 PM)
- *     preferredDaysOff?: Set,      // e.g. new Set(["Fri"])
- *     minHours?:         number,   // default 10
- *     maxHours?:         number,   // default 20
- *   }
- *
+ * @param {Object} prefs      See file header for full prefs shape.
  * @returns {{ score: number, breakdown: Object }}
- *   score is 0–100 (integer).
- *   breakdown mirrors the weights keys, each 0–100.
+ *   score 0–100 (integer), breakdown keys each 0–100.
  */
 function scoreSchedule(schedule, weights, prefs = {}) {
   const {
-    prefStart        = 9  * 60,
-    prefEnd          = 17 * 60,
-    preferredDaysOff = new Set(),
-    minHours         = 10,
-    maxHours         = 20,
+    prefStart    = 10 * 60,
+    prefEnd      = 16 * 60,
+    hardLimits   = {},
+    dayPattern   = "any",
+    minHours     = 12,
+    maxHours     = 20,
   } = prefs;
 
   const secs = schedule.sections ?? [];
 
   const normalised = {
-    professor:  scoreRmp(secs),
-    time:       scoreTime(secs, prefStart, prefEnd),
+    professor:  scoreProfessor(secs),
+    time:       scoreTime(secs, prefStart, prefEnd, hardLimits),
     finals:     scoreFinals(secs),
-    days:       scoreDaysOff(secs, preferredDaysOff),
+    days:       scoreDayPattern(secs, dayPattern),
     difficulty: scoreDifficulty(secs, minHours, maxHours),
   };
 
-  const weightedSum = Object.keys(normalised).reduce((sum, k) => {
-    return sum + (weights[k] ?? 0) * normalised[k];
-  }, 0);
+  const weightedSum = Object.keys(normalised).reduce(
+    (sum, k) => sum + (weights[k] ?? 0) * normalised[k],
+    0
+  );
 
   return {
     score:     Math.round(weightedSum * 100),
@@ -203,13 +309,8 @@ function scoreSchedule(schedule, weights, prefs = {}) {
 }
 
 /**
- * Rank an array of schedule candidates.
- * Annotates each with `.score` and `.breakdown`, then sorts descending.
- *
- * @param {Array}  candidates
- * @param {Object} weights     { professor, time, finals, days, difficulty } summing to 1
- * @param {Object} [prefs]     See scoreSchedule
- * @returns {Array}            Sorted candidates, highest score first
+ * Rank an array of schedule candidates in-place (descending score).
+ * Annotates each with `.score` and `.breakdown`.
  */
 function rankSchedules(candidates, weights, prefs = {}) {
   for (const c of candidates) {
@@ -223,9 +324,12 @@ function rankSchedules(candidates, weights, prefs = {}) {
 export {
   rankSchedules,
   scoreSchedule,
-  scoreRmp,
+  scoreProfessor,
   scoreTime,
   scoreFinals,
-  scoreDaysOff,
+  scoreDayPattern,
   scoreDifficulty,
+  // helpers — useful for unit tests
+  toMins,
+  expandDays,
 };

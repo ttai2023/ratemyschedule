@@ -9,6 +9,7 @@
 //   4. Write the result to a JSON file for in-memory loading
 // ============================================================
 
+import "dotenv/config";
 import { BrowserUse } from "browser-use-sdk";
 import fs from "fs/promises";
 import path from "path";
@@ -124,7 +125,7 @@ async function webregFetch(endpoint, params = {}) {
  * Get the master list of all courses for a term.
  * Returns array of { SUBJ_CODE, CRSE_CODE, CRSE_TITLE }
  */
-async function fetchAllCourses(termCode = "S326") {
+async function fetchAllCourses(termCode = "S126") {
   return webregFetch("search-get-crse-list", {
     termcode: termCode,
     subjlist: "", // empty = all subjects
@@ -135,7 +136,7 @@ async function fetchAllCourses(termCode = "S326") {
  * Get all sections/meetings for a specific course.
  * Returns the raw WebReg JSON array of meeting rows.
  */
-async function fetchCourseSections(subjCode, crseCode, termCode = "S326") {
+async function fetchCourseSections(subjCode, crseCode, termCode = "S126") {
   return webregFetch("search-load-group-data", {
     subjcode: subjCode,
     crsecode: crseCode,
@@ -298,7 +299,7 @@ function sleep(ms) {
  *   }
  * }
  */
-async function buildQuarterJSON(termCode = "S326") {
+async function buildQuarterJSON(termCode = "S126") {
   console.log(`[webreg] Fetching course list for ${termCode}...`);
   const allCourses = await fetchAllCourses(termCode);
 
@@ -377,7 +378,7 @@ async function buildQuarterJSON(termCode = "S326") {
  *
  * Example: buildDepartments(["CSE", "MATH", "ECE", "BILD"])
  */
-async function buildDepartments(deptList, termCode = "S326") {
+async function buildDepartments(deptList, termCode = "S126") {
   console.log(
     `[webreg] Fetching courses for: ${deptList.join(", ")} (${termCode})`
   );
@@ -455,7 +456,7 @@ let scheduleCache = null;
  * Load the schedule JSON into memory. Call once on server startup.
  * After this, use getScheduleData() for O(1) lookups.
  */
-async function loadScheduleIntoMemory(termCode = "S326") {
+async function loadScheduleIntoMemory(termCode = "S126") {
   const filePath = path.join(
     process.cwd(),
     "backend",
