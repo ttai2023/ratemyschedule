@@ -1014,6 +1014,38 @@ header h1 {
   gap: 5px;
 }
 
+.browser-use-panel {
+  background: white;
+  border: 1px solid #e2e6f0;
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.browser-use-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.browser-use-fields input {
+  padding: 6px 8px;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.browser-use-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .audit-courses-panel {
   display: flex;
   flex-direction: column;

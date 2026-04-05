@@ -51,18 +51,44 @@ app.get("/api/health", (req, res) => {
 // ──────────────────────────────────────────────────────────────
 
 /**
- * GET /api/course?code=CSE+100&term=S326
+ * GET /api/getClass?code=CSE+100&term=S326
  *
  * Returns full course data with all sections, meetings, finals.
  */
-app.get("/api/course", (req, res) => {
+app.get("/api/getClass", (req, res) => {
   const { code, term = DEFAULT_TERM } = req.query;
   if (!code) return res.status(400).json({ error: "code param required" });
 
   // Extract subject from course code: "CSE 100" → "CSE"
   const subj = code.split(" ")[0].toUpperCase();
+  const codeNum = code.split(" ")[1];
   const course = getCourse(term, subj, code.toUpperCase());
 
+  // course doesn't exist
+  if (!course) {
+    return res.status(404).json({ error: `Course ${code} not found` });
+  }
+
+  // need to scrap locally
+  if (!course.sections || course.sections.length === 0) {
+    return res.status(204).json({ error: `Course ${code} has no content` });
+  }
+
+  // success
+  res.json(course);
+  return res.status(200).json(course);
+});
+
+/**
+ * POST /api/setClass
+ *
+ * Sets the subject class in the database with same parameters as getClass
+ */
+app.post("/api/setClass", (req, res) => {
+  const { code, term = DEFAULT_TERM } = req.body;
+  if (!code) return res.status(400).json({ error: "code param required" });
+
+  const course = getCourse(term, code.split(" ")[0].toUpperCase(), code.split(" ")[1]);
   if (!course) {
     return res.status(404).json({ error: `Course ${code} not found` });
   }
@@ -71,65 +97,41 @@ app.get("/api/course", (req, res) => {
 });
 
 /**
- * GET /api/department?code=CSE&term=S326
+ * GET /api/getProf
  *
- * Returns all courses in a department.
+ * Get CAPE and Rate My Prof data for a professor by name (e.g. "Smith, John").
  */
-app.get("/api/department", (req, res) => {
-  const { code, term = DEFAULT_TERM } = req.query;
-  if (!code) return res.status(400).json({ error: "code param required" });
+app.get("/api/getProf", (req, res) => {
+  const { name, term = DEFAULT_TERM } = req.query;
+  if (!name) return res.status(400).json({ error: "name param required" });
 
-  const dept = getDepartment(term, code.toUpperCase());
-  if (!dept) {
-    return res.status(404).json({ error: `Department ${code} not found` });
-  }
-
-  res.json(dept);
+  const prof = searchCourses(term, name);
+  res.json({professor: prof});
 });
 
 /**
- * GET /api/search?q=CSE+1&term=S326
+ * POST /api/setBrowserUse
  *
- * Search courses by partial match. For the extension's search bar.
- */
-app.get("/api/search", (req, res) => {
-  const { q, term = DEFAULT_TERM } = req.query;
-  if (!q) return res.status(400).json({ error: "q param required" });
-
-  const results = searchCourses(term, q);
-  res.json({ results, count: results.length });
-});
-
-/**
- * POST /api/sections
+ * Kick off a Browser Use session so the user can log in via SSO.
+ * Body: { pid, email, password }
  *
- * Batch lookup: get sections for multiple courses at once.
- * Body: { courses: ["CSE 100", "CSE 105", "MATH 183"], term: "S326" }
+ * Flow:
+ *  1. Validate pid (must match degree audit on file).
+ *  2. Create a Browser Use project/session (saves cookies + fingerprint for 2FA).
+ *  3. Return sessionUrl so the user can open it, confirm their device, and clear 2FA.
  */
-app.post("/api/sections", (req, res) => {
-  const { courses, term = DEFAULT_TERM } = req.body;
-  if (!courses || !Array.isArray(courses)) {
-    return res.status(400).json({ error: "courses array required" });
-  }
+app.post("/api/setBrowserUse", async (req, res) => {
+  const { pid, email, password } = req.body;
 
-  if (courses.length > 10) {
-    return res.status(400).json({ error: "Max 10 courses per request" });
-  }
+  if (!pid)      return res.status(400).json({ error: "pid required" });
+  if (!email)    return res.status(400).json({ error: "email required" });
+  if (!password) return res.status(400).json({ error: "password required" });
 
-  const results = {};
-  const notFound = [];
+  // TODO: launch Browser Use session with { pid, email, password }
+  const sessionUrl = await startBrowserUseSession({ pid, email, password });
+  res.json({ sessionUrl });
 
-  for (const code of courses) {
-    const subj = code.split(" ")[0].toUpperCase();
-    const course = getCourse(term, subj, code.toUpperCase());
-    if (course) {
-      results[code.toUpperCase()] = course;
-    } else {
-      notFound.push(code);
-    }
-  }
-
-  res.json({ results, not_found: notFound });
+  res.status(501).json({ error: "Browser Use session launch not yet implemented." });
 });
 
 // ──────────────────────────────────────────────────────────────

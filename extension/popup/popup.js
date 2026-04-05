@@ -2457,3 +2457,55 @@ function renderPassZone(zoneId, items) {
     }
   });
 });
+
+// ── Browser Use ─────────────────────────────────────────────────
+
+document.getElementById("browser-use-btn").addEventListener("click", async () => {
+  const statusEl = document.getElementById("browser-use-status");
+  const linkEl   = document.getElementById("browser-use-link");
+  const email    = document.getElementById("bu-email").value.trim();
+  const password = document.getElementById("bu-password").value;
+
+  if (!email || !password) {
+    statusEl.textContent = "Please enter your SSO email and password.";
+    return;
+  }
+
+  const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid || null;
+  if (!pid) {
+    statusEl.textContent = "Fetch your degree audit first so we can verify your PID.";
+    return;
+  }
+
+  statusEl.textContent = "Connecting…";
+  linkEl.style.display = "none";
+  document.getElementById("browser-use-btn").disabled = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/setBrowserUse`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({ pid, email, password }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      statusEl.textContent = `Error: ${data.error || res.statusText}`;
+      return;
+    }
+
+    if (data.sessionUrl) {
+      statusEl.textContent = "Session ready. Open the link to confirm your device for 2FA.";
+      linkEl.href          = data.sessionUrl;
+      linkEl.style.display = "inline";
+    } else {
+      statusEl.textContent = data.message || "Connected.";
+    }
+  } catch {
+    statusEl.textContent = "Could not reach the server. Is it running?";
+  } finally {
+    document.getElementById("browser-use-btn").disabled = false;
+    document.getElementById("bu-password").value = "";
+  }
+});
