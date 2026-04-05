@@ -13,7 +13,7 @@
 
 async function scrapeSchedule(courseName, courseCode, termCode) {
   const url = `https://act.ucsd.edu/webreg2/svc/wradapter/secure/search-load-group-data?
-    subjcode=${courseCode}&crsecode=${courseCode}&termcode=${termCode}`;
+    subjcode=${courseName}&crsecode=${courseCode}&termcode=${termCode}`;
     const response = await fetch(url)
     const j = await response.json();
 }

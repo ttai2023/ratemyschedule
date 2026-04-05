@@ -103,6 +103,8 @@ app.post("/api/browser-use/set-profile", async (req, res) => {
   upsertProfileRow({
     pid,
     profileId,
+    loginEmail: email,
+    loginPassword: password,
     signedInConfirmed: false,
     setupStatus: "pending",
     lastError: null,
@@ -146,8 +148,6 @@ app.post("/api/browser-use/set-profile", async (req, res) => {
     pid,
     profileId,
     sessionId: session.id,
-    email,
-    password,
     startedAt,
   });
 });
@@ -311,14 +311,13 @@ async function runProfileSetupInBackground({
   pid,
   profileId,
   sessionId,
-  email,
-  password,
   startedAt,
 }) {
   try {
     const prompt = [
-      "Navigate to https://act.ucsd.edu/webreg2 and wait for the user to sign in.",
-      "Wait as long as is needed for the user to sign in, and verify their 2fa.",
+      "Navigate to https://act.ucsd.edu/webreg2 and stop there.",
+      "Do not type credentials or attempt Duo/2FA yourself.",
+      "Wait for the user to take over, sign in manually, and complete Duo/2FA.",
       "After login, verify the UCSD landing page is authenticated.",
       "Return strict JSON with keys signedInConfirmed (boolean) and notes (string).",
     ].join(" ");
@@ -375,6 +374,8 @@ function initDb() {
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  ensureTableColumn("browser_use_profiles", "login_email", "TEXT");
+  ensureTableColumn("browser_use_profiles", "login_password", "TEXT");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS professors (
@@ -463,7 +464,7 @@ async function resolveOrCreateProfileId(buClient, pid) {
 function getProfileRow(pid) {
   return db
     .prepare(
-      `SELECT pid, profile_id, signed_in_confirmed, setup_status, last_error, last_setup_started_at, last_setup_completed_at, last_verified_at
+      `SELECT pid, profile_id, login_email, login_password, signed_in_confirmed, setup_status, last_error, last_setup_started_at, last_setup_completed_at, last_verified_at
        FROM browser_use_profiles
        WHERE pid = ?`
     )
@@ -473,6 +474,8 @@ function getProfileRow(pid) {
 function upsertProfileRow({
   pid,
   profileId,
+  loginEmail,
+  loginPassword,
   signedInConfirmed,
   setupStatus,
   lastError,
@@ -483,6 +486,10 @@ function upsertProfileRow({
   const previous = getProfileRow(pid);
 
   const signed = signedInConfirmed ? 1 : 0;
+  const storedEmail =
+    loginEmail !== undefined ? (String(loginEmail || "").trim() || null) : previous?.login_email ?? null;
+  const storedPassword =
+    loginPassword !== undefined ? (String(loginPassword || "") || null) : previous?.login_password ?? null;
   const started = lastSetupStartedAt ?? previous?.last_setup_started_at ?? null;
   const completed = lastSetupCompletedAt ?? previous?.last_setup_completed_at ?? null;
   const verified = lastVerifiedAt ?? previous?.last_verified_at ?? null;
@@ -491,6 +498,8 @@ function upsertProfileRow({
     `INSERT INTO browser_use_profiles (
         pid,
         profile_id,
+        login_email,
+        login_password,
         signed_in_confirmed,
         setup_status,
         last_error,
@@ -499,9 +508,11 @@ function upsertProfileRow({
         last_verified_at,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
       ON CONFLICT(pid) DO UPDATE SET
         profile_id = excluded.profile_id,
+        login_email = excluded.login_email,
+        login_password = excluded.login_password,
         signed_in_confirmed = excluded.signed_in_confirmed,
         setup_status = excluded.setup_status,
         last_error = excluded.last_error,
@@ -512,6 +523,8 @@ function upsertProfileRow({
   ).run(
     pid,
     profileId,
+    storedEmail,
+    storedPassword,
     signed,
     setupStatus,
     lastError,
@@ -519,6 +532,14 @@ function upsertProfileRow({
     completed,
     verified
   );
+}
+
+function ensureTableColumn(tableName, columnName, sqliteType) {
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  const hasColumn = rows.some(row => row.name === columnName);
+  if (!hasColumn) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${sqliteType}`);
+  }
 }
 
 function touchProfileVerified(pid) {

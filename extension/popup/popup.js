@@ -15,7 +15,6 @@ const WEBREG_BASE_URL = "https://act.ucsd.edu/webreg2/svc/wradapter/secure";
 
 // courses: array of { code, name, units, instructors: [{name, rmp}] }
 const courses = [];
-const completedCourses = [];
 const webregCache = {
   termCourseSet: new Map(),
   prerequisites: new Map(),
@@ -1697,6 +1696,7 @@ function extractTermCodeFromUrl(urlString) {
     const url = new URL(urlString);
     const params = url.searchParams;
     const term =
+      params.get("p1") ||
       params.get("termcode") ||
       params.get("termCode") ||
       params.get("term");
@@ -1751,9 +1751,7 @@ function extractPendingSubrequirements(parsedAudit) {
  * Build the set of completed courses (audit + manual user entries).
  */
 function buildCompletedCourseSet(parsedAudit) {
-  const done = new Set(
-    completedCourses.map(code => normalizeCourseCode(code)).filter(Boolean)
-  );
+  const done = new Set();
 
   for (const req of parsedAudit?.requirements ?? []) {
     for (const sub of req.subrequirements ?? []) {
@@ -2069,54 +2067,6 @@ function renderCourseList() {
   }).join("");
   list.querySelectorAll(".remove-btn").forEach(btn => {
     btn.addEventListener("click", () => removeCourse(btn.dataset.code));
-  });
-}
-
-// ── Completed Courses ──────────────────────────────────────────
-document.getElementById("add-completed-btn").addEventListener("click", addCompleted);
-document.getElementById("completed-input").addEventListener("keydown", e => {
-  if (e.key === "Enter") addCompleted();
-});
-
-document.getElementById("completed-toggle").addEventListener("click", () => {
-  const body  = document.getElementById("completed-section");
-  const arrow = document.querySelector("#completed-toggle .toggle-arrow");
-  const open  = body.style.display !== "none";
-  body.style.display  = open ? "none" : "flex";
-  arrow.textContent   = open ? "▸" : "▾";
-});
-
-function addCompleted() {
-  const input = document.getElementById("completed-input");
-  const code  = input.value.trim().toUpperCase();
-  if (!code || completedCourses.includes(code)) return;
-  completedCourses.push(code);
-  input.value = "";
-  renderCompletedList();
-}
-
-function removeCompleted(code) {
-  const idx = completedCourses.indexOf(code);
-  if (idx !== -1) completedCourses.splice(idx, 1);
-  renderCompletedList();
-}
-
-function renderCompletedList() {
-  const list  = document.getElementById("completed-list");
-  const badge = document.getElementById("completed-count");
-  badge.textContent = completedCourses.length;
-
-  if (completedCourses.length === 0) {
-    list.innerHTML = '<li class="empty-state">No completed courses yet.</li>';
-    return;
-  }
-  list.innerHTML = completedCourses.map(c => `
-    <li>
-      <span>${esc(c)}</span>
-      <button class="remove-btn" data-code="${esc(c)}">&times;</button>
-    </li>`).join("");
-  list.querySelectorAll(".remove-btn").forEach(btn => {
-    btn.addEventListener("click", () => removeCompleted(btn.dataset.code));
   });
 }
 
@@ -2457,6 +2407,8 @@ function adaptSection(sec, fallbackIdx) {
 async function refreshBrowserUseProfileStatus() {
   const profileStateEl = document.getElementById("browser-use-profile-state");
   const connectBtn = document.getElementById("browser-use-btn");
+  const emailInput = document.getElementById("bu-email");
+  const passwordInput = document.getElementById("bu-password");
   const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid || null;
 
   if (!pid) {
@@ -2467,6 +2419,8 @@ async function refreshBrowserUseProfileStatus() {
     browserUseProfileState.lastError = null;
     if (profileStateEl) profileStateEl.textContent = "Profile status: fetch degree audit to verify PID.";
     if (connectBtn) connectBtn.disabled = false;
+    if (emailInput) emailInput.disabled = false;
+    if (passwordInput) passwordInput.disabled = false;
     return browserUseProfileState;
   }
 
@@ -2483,7 +2437,7 @@ async function refreshBrowserUseProfileStatus() {
 
     if (profileStateEl) {
       if (data.hasProfile) {
-        profileStateEl.textContent = `Profile status: verified (${data.profileId}).`;
+        profileStateEl.textContent = `Profile status: verified (${data.profileId}). Onboarding complete.`;
       } else if (data.setupStatus === "pending") {
         profileStateEl.textContent = "Profile status: setup pending. Complete login in live session.";
       } else if (data.setupStatus === "error") {
@@ -2493,12 +2447,16 @@ async function refreshBrowserUseProfileStatus() {
       }
     }
     if (connectBtn) connectBtn.disabled = Boolean(data.hasProfile);
+    if (emailInput) emailInput.disabled = Boolean(data.hasProfile);
+    if (passwordInput) passwordInput.disabled = Boolean(data.hasProfile);
     return browserUseProfileState;
   } catch (error) {
     if (profileStateEl) {
       profileStateEl.textContent = `Profile status: check failed (${error?.message || error}).`;
     }
     if (connectBtn) connectBtn.disabled = false;
+    if (emailInput) emailInput.disabled = false;
+    if (passwordInput) passwordInput.disabled = false;
     return browserUseProfileState;
   }
 }
@@ -2564,11 +2522,6 @@ async function launchResults() {
     return;
   }
 
-  if (courses.length < 4) {
-    alert("Need 4 courses selected before generating schedules.");
-    return;
-  }
-
   // Switch to results tab and show loading state
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === "results"));
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === "tab-results"));
@@ -2584,8 +2537,8 @@ async function launchResults() {
     const termCode = getCurrentTermCode();
     const selectedCodes = courses.slice(0, 4).map(c => normalizeCourseCode(c.code));
     const entries = await loadCourseEntriesForTerm(selectedCodes, termCode);
-    if (entries.length < 4) {
-      throw new Error(`Only ${entries.length} of 4 selected courses returned schedule data for ${termCode}.`);
+    if (entries.length === 0) {
+      throw new Error(`No selected courses returned schedule data for ${termCode}.`);
     }
 
     await enrichEntriesWithCachedEvaluations(entries);
@@ -2930,7 +2883,7 @@ document.getElementById("browser-use-btn").addEventListener("click", async () =>
     return;
   }
 
-  statusEl.textContent = "Connecting...";
+  statusEl.textContent = "Starting live session...";
   linkEl.style.display = "none";
   document.getElementById("browser-use-btn").disabled = true;
 
@@ -2949,7 +2902,7 @@ document.getElementById("browser-use-btn").addEventListener("click", async () =>
     }
 
     if (data.liveUrl) {
-      statusEl.textContent = "Session ready. Open the link to complete login confirmation.";
+      statusEl.textContent = "Session ready. Open the link, sign in manually, and complete Duo.";
       linkEl.href          = data.liveUrl;
       linkEl.style.display = "inline";
     } else {
@@ -2969,8 +2922,8 @@ document.getElementById("browser-use-btn").addEventListener("click", async () =>
   } finally {
     if (!browserUseProfileState.hasProfile) {
       document.getElementById("browser-use-btn").disabled = false;
-  }
-  document.getElementById("bu-password").value = "";
+    }
+    document.getElementById("bu-password").value = "";
   }
 });
 

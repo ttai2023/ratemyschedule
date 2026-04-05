@@ -1039,6 +1039,17 @@ header h1 {
   box-sizing: border-box;
 }
 
+.browser-use-fields input:disabled {
+  background: #f2f4f7;
+  color: #98a2b3;
+  cursor: not-allowed;
+}
+
+#browser-use-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .browser-use-actions {
   display: flex;
   align-items: center;
