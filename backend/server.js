@@ -19,7 +19,7 @@ import {
 } from "./scraping/webreg.js";
 import { generateSchedules } from "./scheduler.js";
 import { handleRank } from "./handler.js";
-import { rankSchedules } from "./scorer.js";
+import { rankSchedules, recommendPasses } from "./scorer.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -342,6 +342,7 @@ app.post("/api/recommend", (req, res) => {
       breakdown: sched.breakdown,
       sections:  sched.sections,
       summary:   buildSummary(sched),
+      passes:    recommendPasses(sched.sections),
     })),
     meta: {
       total_valid:   schedules.length,

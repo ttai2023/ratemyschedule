@@ -263,6 +263,103 @@ function scoreDifficulty(sections, minHrs = 12, maxHrs = 20) {
   return clamp(1 - (total - maxHrs) / maxHrs);
 }
 
+// ── 6. Enrollment difficulty / pass recommendation ───────────
+
+/**
+ * Computes a normalized enrollment difficulty score [0, 1] for a single section.
+ *
+ *   fillRate = (seats_total - seats_available) / seats_total
+ *
+ * If no seat data is available, returns 0 (unknown → assume easy).
+ */
+function scoreEnrollmentDifficulty(section) {
+  const total = section.seats_total;
+  const avail = section.seats_available;
+  if (total == null || total <= 0 || avail == null) return 0;
+  return clamp((total - avail) / total);
+}
+
+/**
+ * Given the sections of a chosen schedule, recommends which to enroll in
+ * during First Pass vs Second Pass.
+ *
+ * First Pass criteria (either):
+ *   - Fill rate >= 0.5 (more than half full — high competition)
+ *   - No one on waitlist AND fill rate >= 0.3 (can't recover if missed)
+ *
+ * Second Pass:
+ *   - Everything else (high availability or active waitlist as safety net)
+ *
+ * Returns:
+ * {
+ *   label:      string,   // "First Pass: [X, Y] / Second Pass: [Z, W]"
+ *   firstPass:  string[], // ["CSE 101 A00", ...]
+ *   secondPass: string[], // ["CSE 105 B00", ...]
+ *   details:    Array,    // per-section breakdown with reason
+ * }
+ */
+function recommendPasses(sections) {
+  const details = sections.map(section => {
+    const total    = section.seats_total    ?? 0;
+    const avail    = section.seats_available ?? total;
+    const waitlist = section.waitlist        ?? 0;
+
+    const fillRate   = total > 0 ? clamp((total - avail) / total) : 0;
+    const noWaitlist = waitlist === 0;
+
+    // First pass if heavily filled OR no waitlist to fall back on
+    const isFirst = fillRate >= 0.5 || (noWaitlist && fillRate >= 0.3);
+
+    // Build a human-readable reason
+    const fillPct  = Math.round(fillRate * 100);
+    const availPct = total > 0 ? Math.round((avail / total) * 100) : null;
+    let reason;
+    if (fillRate >= 0.85) {
+      reason = `${fillPct}% full – very high competition`;
+    } else if (fillRate >= 0.5 && !noWaitlist) {
+      reason = `${fillPct}% full`;
+    } else if (noWaitlist && fillRate >= 0.3) {
+      reason = `No waitlist – can't recover if missed (${fillPct}% full)`;
+    } else if (noWaitlist) {
+      reason = `No waitlist – register early to be safe`;
+    } else {
+      reason = availPct != null
+        ? `${availPct}% seats available${waitlist > 0 ? `, ${waitlist} on waitlist` : ""}`
+        : "High availability";
+    }
+
+    return {
+      courseCode:           section.courseCode,
+      section_id:           section.section_id,
+      fillRate:             Math.round(fillRate * 100) / 100,
+      seats_available:      avail,
+      seats_total:          total,
+      waitlist,
+      noWaitlist,
+      enrollmentDifficulty: fillRate >= 0.7 ? "high" : fillRate >= 0.4 ? "medium" : "low",
+      pass:                 isFirst ? "first" : "second",
+      reason,
+    };
+  });
+
+  // Sort first pass hardest-first, second pass easiest-first
+  const firstPass  = details.filter(d => d.pass === "first")
+    .sort((a, b) => b.fillRate - a.fillRate);
+  const secondPass = details.filter(d => d.pass === "second")
+    .sort((a, b) => a.fillRate - b.fillRate);
+
+  const fmt  = d => `${d.courseCode} ${d.section_id}`;
+  const fpStr = firstPass.length  ? firstPass.map(fmt).join(", ")  : "none";
+  const spStr = secondPass.length ? secondPass.map(fmt).join(", ") : "none";
+
+  return {
+    label:      `First Pass: [${fpStr}] / Second Pass: [${spStr}]`,
+    firstPass:  firstPass.map(fmt),
+    secondPass: secondPass.map(fmt),
+    details,
+  };
+}
+
 // ── Aggregate scorer ─────────────────────────────────────────
 
 /**
@@ -329,6 +426,8 @@ export {
   scoreFinals,
   scoreDayPattern,
   scoreDifficulty,
+  scoreEnrollmentDifficulty,
+  recommendPasses,
   // helpers — useful for unit tests
   toMins,
   expandDays,
