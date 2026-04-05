@@ -4,8 +4,6 @@ import cors from "cors";
 import Database from "better-sqlite3";
 import { BrowserUse } from "browser-use-sdk/v3";
 import { z } from "zod";
-import { generateSchedules } from "./scheduler.js";
-import { rankSchedules, recommendPasses } from "./scorer.js";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1167,74 +1165,6 @@ function dedupeStrings(values) {
 }
 
 // ── Weight generator ──────────────────────────────────────────
-
-function rankToWeights(priorities) {
-  const raw = {};
-  priorities.forEach((key, i) => {
-    raw[key] = 1.0 / (i + 1);
-  });
-  const total = Object.values(raw).reduce((a, b) => a + b, 0);
-  return Object.fromEntries(
-    Object.entries(raw).map(([k, v]) => [k, v / total])
-  );
-}
-
-// ── The endpoint ──────────────────────────────────────────────
-
-app.post("/api/recommend", (req, res) => {
-  const {
-    courses,
-    priorities = ["professor", "time", "finals", "days", "difficulty"],
-    prefs = {},
-    term = "S326",
-    topN = 5,
-  } = req.body;
-
-  if (!Array.isArray(courses) || !courses.length) {
-    return res.status(400).json({ error: "courses array required" });
-  }
-  if (courses.length > 8) {
-    return res.status(400).json({ error: "Max 8 courses per request" });
-  }
-
-  // 1. Generate conflict-free schedule candidates
-  const { schedules, totalBundles, missing } =
-    generateSchedules(courses, term);
-
-  if (!schedules.length) {
-    return res.json({
-      schedules: [],
-      total_candidates: 0,
-      totalBundles,
-      missing,
-      message: missing.length
-        ? `Courses not found: ${missing.join(", ")}`
-        : "No conflict-free schedules possible",
-    });
-  }
-
-  // 2. Convert priority ranking → weights
-  const weights = rankToWeights(priorities);
-
-  // 3. Score and rank
-  rankSchedules(schedules, weights, prefs);
-
-  // 4. Slice top N, attach pass strategy
-  const top = schedules.slice(0, topN).map(s => ({
-    ...s,
-    passStrategy: recommendPasses(s.sections),
-  }));
-
-  res.json({
-    schedules: top,
-    total_candidates: schedules.length,
-    totalBundles,
-    missing,
-    weights,
-  });
-});
-
-// ── In-memory job store (fine for hackathon) ──────────────────
 
 const enrollmentJobs = new Map(); // jobId → job object
 

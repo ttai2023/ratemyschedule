@@ -2143,15 +2143,24 @@ function formatUnitsForDisplay(units) {
 }
 
 async function fetchCoursePrerequisites(courseCode, termCode) {
-  const normalized = normalizeCourseCode(courseCode);
+  const { normalized, subj, num } = splitCourseCodeForWebReg(courseCode);
   const term = normalizeTermCode(termCode);
   if (!term) {
     throw new Error("A valid term code is required before resolving prerequisites.");
   }
+  if (!subj || !num) {
+    throw new Error(`Could not split course code "${normalized}" into subject and number.`);
+  }
   const cacheKey = `${term}|${normalized}`;
   if (webregCache.prerequisites.has(cacheKey)) return webregCache.prerequisites.get(cacheKey);
 
-  const [subj, num] = normalized.split(" ");
+  pushScheduleDebug("prereq query", {
+    courseCode: normalized,
+    subjcode: subj,
+    crsecode: num,
+    termcode: term,
+  });
+
   const url =
     `${WEBREG_BASE_URL}/get-prerequisites?subjcode=${encodeURIComponent(subj)}` +
     `&crsecode=${encodeURIComponent(num)}` +
@@ -2165,6 +2174,13 @@ async function fetchCoursePrerequisites(courseCode, termCode) {
       .map(row => normalizeCourseCode(`${String(row?.SUBJECT_CODE || "").trim()} ${String(row?.COURSE_CODE || "").trim()}`))
       .filter(Boolean)
   )];
+
+  pushScheduleDebug("prereq parsed", {
+    courseCode: normalized,
+    rowCount: Array.isArray(rows) ? rows.length : 0,
+    prereqCount: prereqs.length,
+    prereqs,
+  });
 
   webregCache.prerequisites.set(cacheKey, prereqs);
   return prereqs;
@@ -2249,21 +2265,54 @@ function normalizeCourseCode(raw) {
   return String(raw || "").toUpperCase().replace(/\s+/g, " ").trim();
 }
 
-async function fetchLoadGroupData(courseCode, termCode) {
+function splitCourseCodeForWebReg(courseCode) {
   const normalized = normalizeCourseCode(courseCode);
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (tokens.length < 2) {
+    return { normalized, subj: normalized, num: "" };
+  }
+  const num = tokens[tokens.length - 1];
+  const subj = tokens.slice(0, -1).join(" ");
+  return { normalized, subj, num };
+}
+
+async function fetchLoadGroupData(courseCode, termCode) {
+  const { normalized, subj, num } = splitCourseCodeForWebReg(courseCode);
   const term = normalizeTermCode(termCode);
   if (!term) {
     throw new Error("A valid term code is required before loading section data.");
   }
+  if (!subj || !num) {
+    throw new Error(`Could not split course code "${normalized}" into subject and number.`);
+  }
 
-  const [subj, num] = normalized.split(" ");
+  pushScheduleDebug("load-group query", {
+    courseCode: normalized,
+    subjcode: subj,
+    crsecode: num,
+    termcode: term,
+  });
+
   const url =
     `${WEBREG_BASE_URL}/search-load-group-data?subjcode=${encodeURIComponent(subj)}` +
     `&crsecode=${encodeURIComponent(num)}` +
     `&termcode=${encodeURIComponent(term)}` +
     `&_=${Date.now()}`;
   const rows = await fetchWebRegJson(url);
-  return window.ScheduleEngine.parseLoadGroupDataRows(rows, normalized);
+  const parsed = window.ScheduleEngine.parseLoadGroupDataRows(rows, normalized);
+  pushScheduleDebug("load-group parsed", {
+    courseCode: normalized,
+    rowCount: Array.isArray(rows) ? rows.length : 0,
+    debug: parsed?.debug || null,
+    parsedSections: (parsed?.sections || []).map(section => ({
+      sectionId: section.section_id,
+      type: section.type,
+      meetings: (section.meetings || []).length,
+      hasFinal: Boolean(section.final),
+      status: section.status || "",
+    })),
+  });
+  return parsed;
 }
 
 async function populateCoursesFromAudit(parsedAudit) {
@@ -2752,16 +2801,25 @@ async function refreshBrowserUseProfileStatus() {
   }
 }
 
-async function ensureVerifiedProfileForScheduling() {
+function getPidForScheduling() {
   const pid = degreeAuditState.latestAudit?.parsedAudit?.student?.pid || null;
   if (!pid) {
     throw new Error("Fetch your degree audit first so we can verify your PID.");
   }
-  const state = await refreshBrowserUseProfileStatus();
-  if (!state.hasProfile) {
-    throw new Error("Browser Use profile is not verified for this PID yet.");
-  }
-  return { pid, profileId: state.profileId || null };
+  return pid;
+}
+
+async function getEvalContextForScheduling() {
+  const pid = getPidForScheduling();
+  const profileState = await refreshBrowserUseProfileStatus();
+  pushScheduleDebug("eval context", {
+    pid,
+    hasProfile: Boolean(profileState?.hasProfile),
+    setupStatus: profileState?.setupStatus || "missing",
+    signedInConfirmed: Boolean(profileState?.signedInConfirmed),
+    profileId: profileState?.profileId || null,
+  });
+  return { pid, profileState };
 }
 
 function pushScheduleDebug(message, details = null) {
@@ -2800,16 +2858,45 @@ async function loadCourseEntriesForTerm(courseCodes, termCode) {
   const entries = [];
   const unavailable = [];
   for (const code of courseCodes) {
-    const parsed = await fetchLoadGroupData(code, termCode);
-    if (!parsed?.sections?.length) {
+    pushScheduleDebug("loading sections for course", { code, termCode });
+    try {
+      const parsed = await fetchLoadGroupData(code, termCode);
+      if (!parsed?.sections?.length) {
+        const reason = buildUnavailableReason(parsed);
+        unavailable.push({
+          code,
+          reason,
+          debug: parsed?.debug || null,
+        });
+        pushScheduleDebug(`course unavailable: ${code}`, {
+          code,
+          termCode,
+          reason,
+          debug: parsed?.debug || null,
+        });
+        continue;
+      }
+      pushScheduleDebug("course parsed with active sections", {
+        code,
+        termCode,
+        sectionCount: parsed.sections.length,
+        sectionIds: parsed.sections.map(section => section.section_id),
+        rowDebug: parsed?.debug || null,
+      });
+      entries.push({ code, sections: parsed.sections });
+    } catch (error) {
+      const reason = `Load-group fetch/parse failed: ${error?.message || error}`;
       unavailable.push({
         code,
-        reason: buildUnavailableReason(parsed),
-        debug: parsed?.debug || null,
+        reason,
+        debug: null,
       });
-      continue;
+      pushScheduleDebug(`course unavailable: ${code}`, {
+        code,
+        termCode,
+        reason,
+      });
     }
-    entries.push({ code, sections: parsed.sections });
   }
 
   const dedupedUnavailable = [];
@@ -2832,30 +2919,119 @@ function normalizeProfessorEvalKey(name, courseCode) {
 
 async function ensureEvalForProfessor(pid, name, courseCode) {
   const normalizedName = String(name || "").replace(/\s+/g, " ").trim();
-  if (!normalizedName || /^staff$/i.test(normalizedName)) return null;
+  if (!normalizedName || /^staff$/i.test(normalizedName)) {
+    return { status: "skipped_staff", found: false, payload: null, errors: null };
+  }
 
   const normalizedCourseCode = normalizeCourseCode(courseCode);
   const cacheKey = normalizeProfessorEvalKey(normalizedName, normalizedCourseCode);
-  if (webregCache.evals.has(cacheKey)) return webregCache.evals.get(cacheKey);
+  if (webregCache.evals.has(cacheKey)) {
+    const cached = webregCache.evals.get(cacheKey);
+    return {
+      status: cached ? "cache_found" : "cache_empty",
+      found: Boolean(cached),
+      payload: cached,
+      errors: cached?.errors || null,
+    };
+  }
 
-  const res = await fetch(`${API_BASE}/api/evals/professor/ensure`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      pid,
+  const startedAt = Date.now();
+  pushScheduleDebug("eval ensure request start", {
+    pid,
+    name: normalizedName,
+    courseCode: normalizedCourseCode,
+  });
+
+  let res;
+  try {
+    res = await fetch(`${API_BASE}/api/evals/professor/ensure`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pid,
+        name: normalizedName,
+        courseCode: normalizedCourseCode,
+      }),
+    });
+  } catch (error) {
+    const message = error?.message || String(error);
+    webregCache.evals.set(cacheKey, null);
+    pushScheduleDebug("eval ensure request network error", {
       name: normalizedName,
       courseCode: normalizedCourseCode,
-    }),
-  });
+      error: message,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      status: "error",
+      found: false,
+      payload: null,
+      errors: { rmp: message, cape: message },
+    };
+  }
 
   if (!res.ok) {
     webregCache.evals.set(cacheKey, null);
-    return null;
+    pushScheduleDebug("eval ensure request failed", {
+      name: normalizedName,
+      courseCode: normalizedCourseCode,
+      status: res.status,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      status: "error",
+      found: false,
+      payload: null,
+      errors: { rmp: `HTTP ${res.status}`, cape: `HTTP ${res.status}` },
+    };
   }
-  const payload = await res.json();
+
+  let payload;
+  try {
+    payload = await res.json();
+  } catch (error) {
+    const message = error?.message || String(error);
+    webregCache.evals.set(cacheKey, null);
+    pushScheduleDebug("eval ensure response parse error", {
+      name: normalizedName,
+      courseCode: normalizedCourseCode,
+      error: message,
+      durationMs: Date.now() - startedAt,
+    });
+    return {
+      status: "error",
+      found: false,
+      payload: null,
+      errors: { rmp: message, cape: message },
+    };
+  }
+
   const value = payload?.found ? payload : null;
   webregCache.evals.set(cacheKey, value);
-  return value;
+  const errors = payload?.errors || null;
+  const hasErrors = Boolean(errors?.rmp || errors?.cape);
+
+  let status = "miss";
+  if (payload?.found && hasErrors) status = "partial";
+  else if (payload?.found) status = "found";
+  else if (hasErrors) status = "miss_error";
+
+  pushScheduleDebug("eval ensure request end", {
+    name: normalizedName,
+    courseCode: normalizedCourseCode,
+    status,
+    found: Boolean(payload?.found),
+    source: payload?.source || null,
+    errors,
+    durationMs: Date.now() - startedAt,
+  });
+
+  return {
+    status,
+    found: Boolean(payload?.found),
+    payload: value,
+    errors,
+  };
 }
 
 async function runWithConcurrency(items, limit, worker) {
@@ -2891,13 +3067,50 @@ function collectInstructorCoursePairs(entries) {
 
 async function enrichEntriesWithEnsuredEvaluations(entries, pid) {
   const pairs = collectInstructorCoursePairs(entries);
-  const failedPairs = [];
+  const summary = {
+    pairCount: pairs.length,
+    foundCount: 0,
+    partialCount: 0,
+    missCount: 0,
+    errorCount: 0,
+    cacheFoundCount: 0,
+    cacheEmptyCount: 0,
+    skippedCount: 0,
+    failedPairs: [],
+    partialPairs: [],
+    missPairs: [],
+  };
+
+  pushScheduleDebug("eval enrichment start", { pairCount: pairs.length });
 
   await runWithConcurrency(pairs, 4, async pair => {
     try {
-      await ensureEvalForProfessor(pid, pair.name, pair.courseCode);
-    } catch {
-      failedPairs.push(`${pair.name} (${pair.courseCode})`);
+      const outcome = await ensureEvalForProfessor(pid, pair.name, pair.courseCode);
+      const label = `${pair.name} (${pair.courseCode})`;
+      if (outcome?.status === "found") summary.foundCount += 1;
+      else if (outcome?.status === "partial") {
+        summary.partialCount += 1;
+        summary.partialPairs.push(label);
+      } else if (outcome?.status === "miss" || outcome?.status === "miss_error") {
+        summary.missCount += 1;
+        summary.missPairs.push(label);
+      } else if (outcome?.status === "error") {
+        summary.errorCount += 1;
+        summary.failedPairs.push(label);
+      } else if (outcome?.status === "cache_found") {
+        summary.cacheFoundCount += 1;
+      } else if (outcome?.status === "cache_empty") {
+        summary.cacheEmptyCount += 1;
+      } else if (outcome?.status === "skipped_staff") {
+        summary.skippedCount += 1;
+      }
+    } catch (error) {
+      summary.errorCount += 1;
+      summary.failedPairs.push(`${pair.name} (${pair.courseCode})`);
+      pushScheduleDebug("eval enrichment worker error", {
+        pair,
+        error: error?.message || String(error),
+      });
     }
   });
 
@@ -2912,10 +3125,8 @@ async function enrichEntriesWithEnsuredEvaluations(entries, pid) {
     }
   }
 
-  return {
-    pairCount: pairs.length,
-    failedPairs,
-  };
+  pushScheduleDebug("eval enrichment summary", summary);
+  return summary;
 }
 
 function setResultsWarning(message) {
@@ -2953,7 +3164,7 @@ async function launchResults() {
   webregCache.evals.clear();
 
   try {
-    const { pid } = await ensureVerifiedProfileForScheduling();
+    const { pid } = await getEvalContextForScheduling();
 
     const termCode = ensureTermCodeForAction("generating schedules");
     if (!termCode) {
@@ -2961,6 +3172,11 @@ async function launchResults() {
     }
 
     const selectedCodes = courses.slice(0, 4).map(c => normalizeCourseCode(c.code));
+    pushScheduleDebug("schedule generation start", {
+      termCode,
+      selectedCodes,
+      selectedCount: selectedCodes.length,
+    });
     const { entries, unavailable } = await loadCourseEntriesForTerm(selectedCodes, termCode);
     const warnings = [];
     if (unavailable.length) {
@@ -2975,8 +3191,14 @@ async function launchResults() {
     }
 
     const evalSummary = await enrichEntriesWithEnsuredEvaluations(entries, pid);
-    if (evalSummary.failedPairs.length) {
-      warnings.push(`Some professor evaluations could not be refreshed (${evalSummary.failedPairs.length}).`);
+    const incompleteEvalCount =
+      (evalSummary.errorCount || 0) +
+      (evalSummary.partialCount || 0) +
+      (evalSummary.missCount || 0);
+    if (incompleteEvalCount > 0) {
+      warnings.push(
+        `Professor evaluations incomplete (${incompleteEvalCount}/${evalSummary.pairCount}) - schedules generated with available data.`
+      );
     }
     setResultsWarning(warnings.join(" | "));
 
@@ -2984,6 +3206,15 @@ async function launchResults() {
     const generated = window.ScheduleEngine.generateSchedules(entries, {
       allowOverlaps: !prefs.requireNoConflicts,
       maxCandidates: 2000,
+    });
+    pushScheduleDebug("bundle generation summary", {
+      perCourse: entries.map((entry, idx) => ({
+        courseCode: entry.code,
+        sectionCount: entry.sections.length,
+        bundleCount: generated.totalBundles?.[idx] ?? null,
+      })),
+      missing: generated.missing || [],
+      candidateCount: (generated.schedules || []).length,
     });
     if (generated.missing?.length) {
       for (const code of generated.missing) {
@@ -3011,6 +3242,12 @@ async function launchResults() {
 
     if (!candidateSchedules.length) {
       const msg = "No valid schedules found for the selected courses and constraints.";
+      pushScheduleDebug("no valid schedules after filtering", {
+        termCode,
+        selectedCodes,
+        requireNoConflicts: Boolean(prefs.requireNoConflicts),
+        hardNoFriday: Boolean(prefs.hardNoFriday),
+      });
       document.getElementById("sched-label").textContent = msg;
       activeSchedules = [];
       currentScheduleIdx = 0;
