@@ -1614,6 +1614,7 @@ async function populateCoursesFromAudit(parsedAudit) {
   const notFound = needed.length - available.length;
   const parts = [`${available.length} required course${available.length !== 1 ? "s" : ""} loaded`];
   if (notFound > 0) parts.push(`${notFound} not offered this term`);
+  if (available.length === 0) parts.push(`(audit sample: ${needed.slice(0, 5).join(", ")})`);
   statusEl.textContent = parts.join(" · ");
 
   renderCourseList();
